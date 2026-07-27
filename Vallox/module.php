@@ -123,6 +123,7 @@ class ValloxMV extends IPSModule
 
         $this->RegisterVariableFloat('Humidity', 'Luftfeuchte', '~Humidity.F', 80);
         $this->RegisterVariableInteger('CO2', 'CO₂', $this->GetProfileName('CO2'), 90);
+        $this->RegisterVariableInteger('CO2Rating', 'Luftqualität (CO₂)', $this->GetProfileName('CO2Level'), 95);
 
         $this->RegisterVariableInteger('FanSpeed',        'Lüfterstufe',                 $this->GetProfileName('Percent'), 100);
         $this->RegisterVariableInteger('ExtractFanSpeed', 'Abluftventilator (Drehzahl)', $this->GetProfileName('RPM'), 110);
@@ -487,6 +488,37 @@ class ValloxMV extends IPSModule
 
         $this->SetValueIfChanged('Profile', $this->DeriveProfile($raw));
         $this->ComputeEfficiency($raw);
+        $this->RateCO2($raw);
+    }
+
+    /**
+     * CO₂-Wert (ppm) in eine Luftqualitäts-Stufe (0–4) einordnen.
+     * Schwellen nach gängiger Innenraumbewertung (Pettenkofer/UBA).
+     *
+     * @param array<string,int> $raw
+     */
+    private function RateCO2(array $raw): void
+    {
+        if (!array_key_exists('A_CYC_CO2_VALUE', $raw)) {
+            return;
+        }
+        $ppm = (int)$raw['A_CYC_CO2_VALUE'];
+        if ($ppm === self::RAW_INVALID || $ppm <= 0) {
+            return; // kein CO₂-Sensor / ungültig
+        }
+
+        if ($ppm <= 800) {
+            $level = 0; // Sehr gut
+        } elseif ($ppm <= 1000) {
+            $level = 1; // Gut
+        } elseif ($ppm <= 1400) {
+            $level = 2; // Mäßig
+        } elseif ($ppm <= 2000) {
+            $level = 3; // Schlecht
+        } else {
+            $level = 4; // Sehr schlecht
+        }
+        $this->SetValueIfChanged('CO2Rating', $level);
     }
 
     /**
@@ -1205,6 +1237,17 @@ class ValloxMV extends IPSModule
             IPS_CreateVariableProfile($pCO2, VARIABLETYPE_INTEGER);
             IPS_SetVariableProfileText($pCO2, '', ' ppm');
             IPS_SetVariableProfileIcon($pCO2, 'Gauge');
+        }
+
+        $pCO2Level = $this->GetProfileName('CO2Level');
+        if (!IPS_VariableProfileExists($pCO2Level)) {
+            IPS_CreateVariableProfile($pCO2Level, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileIcon($pCO2Level, 'Gauge');
+            IPS_SetVariableProfileAssociation($pCO2Level, 0, 'Sehr gut',      '', 0x00C853);
+            IPS_SetVariableProfileAssociation($pCO2Level, 1, 'Gut',           '', 0x8BC34A);
+            IPS_SetVariableProfileAssociation($pCO2Level, 2, 'Mäßig',         '', 0xFFC107);
+            IPS_SetVariableProfileAssociation($pCO2Level, 3, 'Schlecht',      '', 0xFF8000);
+            IPS_SetVariableProfileAssociation($pCO2Level, 4, 'Sehr schlecht', '', 0xD50000);
         }
 
         $pMin = $this->GetProfileName('Minutes');
