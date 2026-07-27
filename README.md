@@ -3,17 +3,22 @@
 IP-Symcon-Modul für **Vallox-Lüftungsanlagen** (MyVallox / MV-Serie, u. a.
 **ValloPlus 270 MV**) über die MyVallox-WebSocket-Schnittstelle.
 
-> ⚠️ **v0.1 – noch nicht gegen echte Hardware getestet.** Protokoll und
-> Register-Offsets sind aus den etablierten Referenz-Implementierungen
-> rekonstruiert und byte-genau nachgebaut, der Test am realen Gerät steht aus.
-> Siehe [CLAUDE.md](CLAUDE.md) → „Am echten Gerät zu prüfen".
+> **Status v0.1 – Lesezugriff live am echten ValloPlus 270 MV verifiziert**
+> (Firmware v2, alle Register-Offsets exakt bestätigt). Das Schreiben
+> (Profilwechsel) ist implementiert, aber am Gerät noch nicht live getestet.
 
 ## Funktionen
 
 - **Auslesen:** Außen-/Zu-/Ab-/Fortluft-Temperatur, Luftfeuchte, CO₂,
-  Lüfterstufe + Zu-/Abluftventilator, Wärmetauscher-Zustand, Abtauung,
-  Rest-Timer (Boost/Kamin/Extra), Filterwechsel-Restzeit, Störungszähler,
-  Gerätemodell.
+  Lüfterstufe (%), Zu-/Abluftventilator-Drehzahl (rpm), Wärmetauscher-Zustand,
+  Abtauung, Rest-Timer (Boost/Kamin/Extra), Filterwechsel-Restzeit,
+  Betriebsstunden, Heizregister-Status, Störungszähler, Gerätemodell.
+- **Wärmerückgewinnungs-Wirkungsgrad:** aus den Temperaturen berechnet
+  (das Gerät füllt die Wirkungsgrad-Register nicht), nur im Rückgewinnungs-
+  betrieb bei ausreichender Temperaturdifferenz.
+- **Verbrauch:** eine externe Messvariable (z. B. Zwischenzähler/Messsteckdose)
+  kann in der Konfig verknüpft und in die Instanz gespiegelt werden — die
+  Anlage selbst liefert keinen elektrischen Verbrauch.
 - **Steuern:** Betriebsprofil setzen — Home, Away, Boost, Fireplace, Extra, Auto
   (Boost/Fireplace/Extra mit optionaler Dauer in Minuten).
 
@@ -30,6 +35,7 @@ IP-Symcon-Modul für **Vallox-Lüftungsanlagen** (MyVallox / MV-Serie, u. a.
 |------|-----------|
 | IP-Adresse / Hostname | Netzwerkadresse der Vallox-Anlage |
 | Abfrageintervall | Poll-Intervall in Sekunden (0 = aus) |
+| Verbrauchsvariable | Optional: externe Variable (z. B. Messsteckdose), wird als „Verbrauch" gespiegelt |
 
 Das Datenmodell (Register-Offsets) wird beim Verbinden **bevorzugt vom Gerät**
 geladen und andernfalls aus dem mitgelieferten Modell **2.0.16** aufgebaut.
