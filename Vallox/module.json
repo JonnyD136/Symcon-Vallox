@@ -1,0 +1,11 @@
+{
+  "id": "{5ED1BFDC-8911-4DAC-B865-3B394829F06C}",
+  "name": "Vallox MV",
+  "type": 3,
+  "vendor": "Vallox",
+  "aliases": ["Vallox", "Vallox MV", "ValloPlus 270 MV", "MyVallox", "Vallox KWL", "Lüftungsanlage"],
+  "parentRequirements": [],
+  "childRequirements": [],
+  "implemented": [],
+  "prefix": "VLX"
+}

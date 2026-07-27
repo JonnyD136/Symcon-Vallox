@@ -1,0 +1,70 @@
+{
+  "elements": [
+    {
+      "type": "ValidationTextBox",
+      "name": "Host",
+      "caption": "IP-Adresse / Hostname",
+      "validate": "^[A-Za-z0-9_.-]+$"
+    },
+    {
+      "type": "NumberSpinner",
+      "name": "PollInterval",
+      "caption": "Abfrageintervall (Sekunden, 0 = aus)",
+      "minimum": 0,
+      "maximum": 3600,
+      "suffix": "s"
+    },
+    {
+      "type": "SelectVariable",
+      "name": "PowerVariableID",
+      "caption": "Verbrauchsvariable (optional, z. B. von Messsteckdose)"
+    },
+    {
+      "type": "Label",
+      "caption": "Die gewählte Variable wird als \"Verbrauch\" in diese Instanz gespiegelt (Einheit/Profil werden übernommen) und bei Änderungen automatisch aktualisiert."
+    },
+    {
+      "type": "Label",
+      "caption": "Das Datenmodell (Register-Offsets) wird beim Verbinden bevorzugt vom Gerät geladen. Schlägt das fehl, wird das mitgelieferte Modell 2.0.16 verwendet."
+    }
+  ],
+  "actions": [
+    {
+      "type": "RowLayout",
+      "items": [
+        { "type": "Button", "caption": "Jetzt abfragen",        "onClick": "VLX_Poll($id);" },
+        { "type": "Button", "caption": "Geräteinfo aktualisieren", "onClick": "VLX_RequestInfo($id);" }
+      ]
+    },
+    {
+      "type": "RowLayout",
+      "items": [
+        { "type": "Button", "caption": "Profil: Home",      "onClick": "VLX_SetProfile($id, 1);" },
+        { "type": "Button", "caption": "Profil: Away",      "onClick": "VLX_SetProfile($id, 2);" },
+        { "type": "Button", "caption": "Profil: Boost",     "onClick": "VLX_SetProfile($id, 3);" },
+        { "type": "Button", "caption": "Profil: Fireplace", "onClick": "VLX_SetProfile($id, 4);" },
+        { "type": "Button", "caption": "Profil: Auto",      "onClick": "VLX_SetProfile($id, 6);" }
+      ]
+    },
+    {
+      "type": "TestCenter",
+      "name": "RawRead",
+      "caption": "Einzelnes Register lesen (Debug)",
+      "onClick": "echo VLX_ReadRegisterByName($id, $RawReg);",
+      "items": [
+        {
+          "type": "ValidationTextBox",
+          "name": "RawReg",
+          "caption": "Register-Name (z. B. A_CYC_FAN_SPEED)"
+        }
+      ]
+    }
+  ],
+  "status": [
+    { "code": 102, "icon": "active",   "caption": "Aktiv" },
+    { "code": 104, "icon": "inactive", "caption": "Inaktiv" },
+    { "code": 200, "icon": "error",    "caption": "Keine IP-Adresse konfiguriert" },
+    { "code": 201, "icon": "error",    "caption": "Gerät nicht erreichbar" },
+    { "code": 202, "icon": "error",    "caption": "Datenmodell konnte nicht geladen werden" }
+  ]
+}

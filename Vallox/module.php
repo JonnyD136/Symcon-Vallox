@@ -1,0 +1,1203 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Vallox MV – Zentrale Wohnraumlüftung (KWL) mit MyVallox-Netzwerkschnittstelle
+ *
+ * Standalone Device Module (Type 3), Prefix VLX. Kommuniziert über dieselbe
+ * WebSocket-Schnittstelle wie das MyVallox-Webfrontend:
+ *
+ *   ws://<host>/         (Port 80, Pfad "/")
+ *
+ * Binärprotokoll (Modbus-artig, 16-Bit-Register):
+ *   Rahmen  = length(LE) | command(LE) | payload... | checksum(LE)
+ *             length  = Anzahl 16-Bit-Wörter nach dem Längenfeld
+ *             checksum = Summe aller vorangehenden 16-Bit-LE-Wörter & 0xFFFF
+ *   Lesen   : READ_TABLES → Antwort = großes Array aus uint16 (Big-Endian).
+ *             Jedes Register liegt an einem festen Offset im Antwort-Array.
+ *   Schreiben: WRITE_DATA mit (address, value)-Paaren.
+ *
+ * Register-Adressen → Offset hängen vom Datenmodell der Firmware ab. Das Modell
+ * wird bevorzugt vom Gerät geladen (http://<host>/js/bundle.js bzw. js/vallox.js),
+ * andernfalls dient das mitgelieferte Modell 2.0.16 (datamodel.json) als Fallback.
+ *
+ * Protokoll rekonstruiert aus yozik04/vallox_websocket_api und
+ * danielbayerlein/vallox-api (beide getestet u. a. gegen ValloPlus 270 MV).
+ *
+ * ACHTUNG: Dieses Modul wurde noch NICHT gegen echte Hardware verifiziert
+ * (Gerät folgt). Offsets/Schreibvorgänge vor Produktiveinsatz am Gerät prüfen.
+ *
+ * @author  FACE GmbH
+ * @version 0.1
+ * @see     API-FINDINGS.md
+ */
+class ValloxMV extends IPSModule
+{
+    // ─── Verbindung ─────────────────────────────────────────────────
+    private const HTTP_TIMEOUT = 4;   // Sekunden (Modell-Download)
+    private const WS_TIMEOUT   = 6;   // Sekunden (gesamte WS-Transaktion)
+    private const WS_PORT      = 80;
+    private const WS_PATH      = '/';
+
+    // ─── Modul-Statuscodes ──────────────────────────────────────────
+    private const STATUS_OK        = 102;
+    private const STATUS_NO_HOST   = 200;
+    private const STATUS_OFFLINE   = 201;
+    private const STATUS_NO_MODEL  = 202;
+
+    // ─── Profile (identisch zur Referenz-Enum) ──────────────────────
+    private const PROFILE_NONE      = 0;
+    private const PROFILE_HOME      = 1;
+    private const PROFILE_AWAY      = 2;
+    private const PROFILE_BOOST     = 3;
+    private const PROFILE_FIREPLACE = 4;
+    private const PROFILE_EXTRA     = 5;
+    private const PROFILE_AUTO      = 6;
+
+    private const RAW_INVALID = 0xFFFF;
+
+    /** Register, die als Statusvariablen gepflegt werden (Ident-Suffix ⇒ Register). */
+    private const METRIC_MAP = [
+        'TempOutdoor'     => 'A_CYC_TEMP_OUTDOOR_AIR',
+        'TempSupply'      => 'A_CYC_TEMP_SUPPLY_AIR',
+        'TempExtract'     => 'A_CYC_TEMP_EXTRACT_AIR',
+        'TempExhaust'     => 'A_CYC_TEMP_EXHAUST_AIR',
+        'Humidity'        => 'A_CYC_RH_VALUE',
+        'CO2'             => 'A_CYC_CO2_VALUE',
+        'FanSpeed'        => 'A_CYC_FAN_SPEED',
+        'ExtractFanSpeed' => 'A_CYC_EXTR_FAN_SPEED',
+        'SupplyFanSpeed'  => 'A_CYC_SUPP_FAN_SPEED',
+        'CellState'       => 'A_CYC_CELL_STATE',
+        'Defrosting'      => 'A_CYC_DEFROSTING',
+        'BoostTimer'      => 'A_CYC_BOOST_TIMER',
+        'FireplaceTimer'  => 'A_CYC_FIREPLACE_TIMER',
+        'ExtraTimer'      => 'A_CYC_EXTRA_TIMER',
+        'FilterDaysLeft'  => 'A_CYC_REMAINING_TIME_FOR_FILTER',
+        'FaultCount'      => 'A_CYC_TOTAL_FAULT_COUNT',
+        // Wirkungsgrad wird aus den Temperaturen berechnet (Register liefert 0xFFFF),
+        // siehe ComputeEfficiency().
+        'UpTimeTotal'       => 'A_CYC_TOTAL_UP_TIME_HOURS',
+        'UpTimeCurrent'     => 'A_CYC_CURRENT_UP_TIME_HOURS',
+        'Heater'            => 'A_CYC_IO_HEATER',
+        'ExtraHeater'       => 'A_CYC_IO_EXTRA_HEATER',
+    ];
+
+    /** In-Memory-Cache des aufgelösten Datenmodells (pro Request-Lauf). */
+    private $model = null;
+
+    // ═══════════════════════════════════════════════════════════════
+    //  LIFECYCLE
+    // ═══════════════════════════════════════════════════════════════
+
+    public function Create()
+    {
+        parent::Create();
+
+        $this->RegisterPropertyString('Host', '');
+        $this->RegisterPropertyInteger('PollInterval', 60);
+        $this->RegisterPropertyInteger('PowerVariableID', 0);
+
+        // Aufgelöstes Modell (regs: name → {addr, offset}, ws, source). Leer = noch nicht ermittelt.
+        $this->RegisterAttributeString('ResolvedModel', '');
+
+        $this->RegisterTimer('PollTimer', 0, 'VLX_Poll($_IPS["TARGET"]);');
+
+        $this->EnsureProfiles();
+
+        // ── Statusvariablen ─────────────────────────────────────
+        $this->RegisterVariableBoolean('Online', 'Online', $this->GetProfileName('Online'), 10);
+        $this->RegisterVariableString('Model', 'Modell', '', 20);
+
+        $this->RegisterVariableInteger('Profile', 'Profil', $this->GetProfileName('Profile'), 30);
+        $this->EnableAction('Profile');
+
+        $this->RegisterVariableFloat('TempOutdoor', 'Außenluft', '~Temperature', 40);
+        $this->RegisterVariableFloat('TempSupply',  'Zuluft',    '~Temperature', 50);
+        $this->RegisterVariableFloat('TempExtract', 'Abluft',    '~Temperature', 60);
+        $this->RegisterVariableFloat('TempExhaust', 'Fortluft',  '~Temperature', 70);
+
+        $this->RegisterVariableFloat('Humidity', 'Luftfeuchte', '~Humidity.F', 80);
+        $this->RegisterVariableInteger('CO2', 'CO₂', $this->GetProfileName('CO2'), 90);
+
+        $this->RegisterVariableInteger('FanSpeed',        'Lüfterstufe',                 $this->GetProfileName('Percent'), 100);
+        $this->RegisterVariableInteger('ExtractFanSpeed', 'Abluftventilator (Drehzahl)', $this->GetProfileName('RPM'), 110);
+        $this->RegisterVariableInteger('SupplyFanSpeed',  'Zuluftventilator (Drehzahl)', $this->GetProfileName('RPM'), 120);
+
+        $this->RegisterVariableInteger('CellState',  'Wärmetauscher',  $this->GetProfileName('CellState'), 130);
+        $this->RegisterVariableBoolean('Defrosting', 'Abtauung aktiv', '~Alert',                           140);
+
+        $this->RegisterVariableInteger('SupplyEfficiency',  'Wirkungsgrad Zuluft', $this->GetProfileName('Percent'), 200);
+        $this->RegisterVariableInteger('ExtractEfficiency', 'Wirkungsgrad Abluft', $this->GetProfileName('Percent'), 210);
+        $this->RegisterVariableBoolean('Heater',      'Nachheizung',       '~Switch', 220);
+        $this->RegisterVariableBoolean('ExtraHeater', 'Zusatz-Nachheizung', '~Switch', 230);
+        $this->RegisterVariableInteger('UpTimeTotal',   'Betriebsstunden gesamt',  $this->GetProfileName('Hours'), 240);
+        $this->RegisterVariableInteger('UpTimeCurrent', 'Betriebsstunden aktuell', $this->GetProfileName('Hours'), 250);
+
+        $this->RegisterVariableInteger('BoostTimer',     'Boost verbleibend',     $this->GetProfileName('Minutes'), 150);
+        $this->RegisterVariableInteger('FireplaceTimer', 'Kamin verbleibend',     $this->GetProfileName('Minutes'), 160);
+        $this->RegisterVariableInteger('ExtraTimer',     'Extra verbleibend',     $this->GetProfileName('Minutes'), 170);
+
+        $this->RegisterVariableInteger('FilterDaysLeft', 'Filterwechsel in', $this->GetProfileName('Days'), 180);
+        $this->RegisterVariableInteger('FaultCount',     'Aktive Störungen', '',                            190);
+    }
+
+    public function ApplyChanges()
+    {
+        parent::ApplyChanges();
+
+        // Verbrauchsvariable spiegeln (unabhängig von der Geräteverbindung).
+        $this->SetupPowerMirror();
+
+        $host = trim($this->ReadPropertyString('Host'));
+        if ($host === '') {
+            $this->SetStatus(self::STATUS_NO_HOST);
+            $this->SetTimerInterval('PollTimer', 0);
+            return;
+        }
+
+        $interval = $this->ReadPropertyInteger('PollInterval');
+        $this->SetTimerInterval('PollTimer', $interval > 0 ? $interval * 1000 : 0);
+
+        if (IPS_GetKernelRunlevel() == KR_READY) {
+            $this->RequestInfo();
+            $this->Poll();
+        }
+    }
+
+    public function Destroy()
+    {
+        $prefix = 'VLX.' . $this->InstanceID . '.';
+        foreach (IPS_GetVariableProfileList() as $p) {
+            if (strpos($p, $prefix) === 0) {
+                @IPS_DeleteVariableProfile($p);
+            }
+        }
+        parent::Destroy();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  PUBLIC API (Prefix-Funktionen)
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Alle Register lesen und die Statusvariablen aktualisieren.
+     */
+    public function Poll(): bool
+    {
+        $raw = $this->FetchRawMetrics();
+        if ($raw === false) {
+            $this->SetOffline();
+            return false;
+        }
+
+        $this->SetValueIfChanged('Online', true);
+        $this->SetStatus(self::STATUS_OK);
+        $this->ApplyMetrics($raw);
+        return true;
+    }
+
+    /**
+     * Datenmodell (Register-Offsets) neu ermitteln – bevorzugt vom Gerät,
+     * sonst aus dem mitgelieferten Modell. Aktualisiert außerdem den Modellnamen.
+     */
+    public function RequestInfo(): bool
+    {
+        $resolved = $this->ResolveModel(true);
+        if ($resolved === false) {
+            $this->SetStatus(self::STATUS_NO_MODEL);
+            return false;
+        }
+        // Modellname aus A_CYC_MACHINE_MODEL nachziehen (best effort).
+        $raw = $this->FetchRawMetrics();
+        if (is_array($raw) && isset($raw['A_CYC_MACHINE_MODEL'])) {
+            $this->UpdateModelName((int)$raw['A_CYC_MACHINE_MODEL']);
+        }
+        return true;
+    }
+
+    /**
+     * Betriebsprofil setzen.
+     *
+     * @param int $Profile  1=Home, 2=Away, 3=Boost, 4=Fireplace, 5=Extra, 6=Auto
+     * @param int $Duration Timeout in Minuten für Boost/Fireplace/Extra
+     *                      (0 = Standardeinstellung des Geräts verwenden).
+     */
+    public function SetProfile(int $Profile, int $Duration = 0): bool
+    {
+        $reg = $this->Regs();
+        if ($reg === false) {
+            return false;
+        }
+
+        $needName = function (string $name) use ($reg): bool {
+            return isset($reg[$name]);
+        };
+
+        // Für Boost/Fireplace/Extra ggf. Standarddauer vom Gerät holen.
+        $dur = $Duration;
+        if ($dur <= 0 && in_array($Profile, [self::PROFILE_BOOST, self::PROFILE_FIREPLACE, self::PROFILE_EXTRA], true)) {
+            $defReg = [
+                self::PROFILE_BOOST     => 'A_CYC_BOOST_TIME',
+                self::PROFILE_FIREPLACE => 'A_CYC_FIREPLACE_TIME',
+                self::PROFILE_EXTRA     => 'A_CYC_EXTRA_TIME',
+            ][$Profile];
+            $raw = $this->FetchRawMetrics();
+            $dur = (is_array($raw) && isset($raw[$defReg])) ? (int)$raw[$defReg] : 30;
+        }
+
+        switch ($Profile) {
+            case self::PROFILE_HOME:
+                $writes = ['A_CYC_STATE' => 0, 'A_CYC_BOOST_TIMER' => 0, 'A_CYC_FIREPLACE_TIMER' => 0, 'A_CYC_EXTRA_TIMER' => 0];
+                break;
+            case self::PROFILE_AWAY:
+                $writes = ['A_CYC_STATE' => 1, 'A_CYC_BOOST_TIMER' => 0, 'A_CYC_FIREPLACE_TIMER' => 0, 'A_CYC_EXTRA_TIMER' => 0];
+                break;
+            case self::PROFILE_AUTO:
+                $writes = ['A_CYC_STATE' => 2, 'A_CYC_BOOST_TIMER' => 0, 'A_CYC_FIREPLACE_TIMER' => 0, 'A_CYC_EXTRA_TIMER' => 0];
+                break;
+            case self::PROFILE_BOOST:
+                $writes = ['A_CYC_BOOST_TIMER' => $dur, 'A_CYC_FIREPLACE_TIMER' => 0, 'A_CYC_EXTRA_TIMER' => 0];
+                break;
+            case self::PROFILE_FIREPLACE:
+                $writes = ['A_CYC_BOOST_TIMER' => 0, 'A_CYC_FIREPLACE_TIMER' => $dur, 'A_CYC_EXTRA_TIMER' => 0];
+                break;
+            case self::PROFILE_EXTRA:
+                $writes = ['A_CYC_BOOST_TIMER' => 0, 'A_CYC_FIREPLACE_TIMER' => 0, 'A_CYC_EXTRA_TIMER' => $dur];
+                break;
+            default:
+                $this->SendDebug(__FUNCTION__, 'Unbekanntes Profil: ' . $Profile, 0);
+                return false;
+        }
+
+        // Nur tatsächlich vorhandene Register schreiben.
+        $writes = array_filter($writes, fn($k) => $needName($k), ARRAY_FILTER_USE_KEY);
+        if (count($writes) === 0) {
+            return false;
+        }
+
+        $ok = $this->WriteRegisters($writes);
+        if ($ok) {
+            $this->Poll();
+        }
+        return $ok;
+    }
+
+    /**
+     * Ein einzelnes Register anhand seines Namens lesen (Debug/Test-Center).
+     * @return string
+     */
+    public function ReadRegisterByName(string $Name): string
+    {
+        $Name = trim($Name);
+        if ($Name === '') {
+            return 'ERROR: leerer Name';
+        }
+        $reg = $this->Regs();
+        if ($reg === false) {
+            return 'ERROR: kein Datenmodell';
+        }
+        if (!isset($reg[$Name])) {
+            return 'ERROR: unbekanntes Register (nicht im kuratierten Modell): ' . $Name;
+        }
+        $raw = $this->FetchRawMetrics();
+        if (!is_array($raw) || !array_key_exists($Name, $raw)) {
+            return 'ERROR: keine Antwort';
+        }
+        $v = $raw[$Name];
+        return sprintf('%s = %d (addr=%d, offset=%d)', $Name, (int)$v, $reg[$Name]['addr'], $reg[$Name]['offset']);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  REQUEST ACTION (UI)
+    // ═══════════════════════════════════════════════════════════════
+
+    public function RequestAction($Ident, $Value)
+    {
+        switch ($Ident) {
+            case 'Profile':
+                $this->SetProfile((int)$Value);
+                break;
+            default:
+                $this->SendDebug(__FUNCTION__, 'Unbekannter Ident: ' . $Ident, 0);
+        }
+    }
+
+    /**
+     * Reagiert auf Änderungen der verknüpften Verbrauchsvariable.
+     */
+    public function MessageSink($TimeStamp, $SenderID, $Message, $Data)
+    {
+        if ($Message == VM_UPDATE && $SenderID == $this->ReadPropertyInteger('PowerVariableID')) {
+            $this->UpdatePowerMirror();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  PRIVATE: Verbrauchsvariable spiegeln
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Legt die gespiegelte Variable "Verbrauch" an (Typ/Profil von der Quelle),
+     * registriert die Nachrichtenverfolgung neu und zieht den aktuellen Wert.
+     */
+    private function SetupPowerMirror(): void
+    {
+        // Alte VM_UPDATE-Registrierungen entfernen (Neuaufbau bei jedem ApplyChanges).
+        foreach ($this->GetMessageList() as $senderID => $messages) {
+            foreach ($messages as $msg) {
+                if ($msg == VM_UPDATE) {
+                    $this->UnregisterMessage($senderID, VM_UPDATE);
+                }
+            }
+        }
+
+        $id = $this->ReadPropertyInteger('PowerVariableID');
+        if ($id > 0 && IPS_VariableExists($id)) {
+            $src     = IPS_GetVariable($id);
+            $type    = (int)$src['VariableType'];
+            $profile = $src['VariableCustomProfile'] !== '' ? $src['VariableCustomProfile'] : $src['VariableProfile'];
+
+            $this->MaintainVariable('PowerConsumption', 'Verbrauch', $type, $profile, 195, true);
+            $this->RegisterMessage($id, VM_UPDATE);
+            $this->UpdatePowerMirror();
+        } else {
+            // Verknüpfung entfernt → Variable wieder abbauen.
+            $this->MaintainVariable('PowerConsumption', 'Verbrauch', VARIABLETYPE_FLOAT, '', 195, false);
+        }
+    }
+
+    /**
+     * Aktuellen Wert der Quellvariable in die gespiegelte Variable übernehmen.
+     */
+    private function UpdatePowerMirror(): void
+    {
+        $id = $this->ReadPropertyInteger('PowerVariableID');
+        if ($id > 0 && IPS_VariableExists($id) && @$this->GetIDForIdent('PowerConsumption')) {
+            $this->SetValueIfChanged('PowerConsumption', GetValue($id));
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  PRIVATE: Metrik-Verarbeitung
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * READ_TABLES ausführen und alle kuratierten Register als Rohwerte (name → int)
+     * zurückgeben. 0xFFFF wird als "ungültig" durchgereicht (Filterung erfolgt später).
+     * @return array<string,int>|false
+     */
+    private function FetchRawMetrics()
+    {
+        $reg = $this->Regs();
+        if ($reg === false) {
+            return false;
+        }
+
+        $payload = $this->BuildReadTableRequest();
+        $frames  = $this->WsTransact([$payload], 1);
+        if ($frames === false || count($frames) === 0) {
+            return false;
+        }
+
+        $words = $this->ParseUint16BE($frames[0]);
+        $count = count($words);
+        if ($count === 0) {
+            return false;
+        }
+
+        $raw = [];
+        foreach ($reg as $name => $info) {
+            $off = $info['offset'];
+            if ($off >= 0 && $off < $count) {
+                $raw[$name] = $words[$off];
+            }
+        }
+        return $raw;
+    }
+
+    /**
+     * Rohwerte in Statusvariablen umsetzen (inkl. Einheiten-Konvertierung).
+     * @param array<string,int> $raw
+     */
+    private function ApplyMetrics(array $raw): void
+    {
+        if (isset($raw['A_CYC_MACHINE_MODEL'])) {
+            $this->UpdateModelName((int)$raw['A_CYC_MACHINE_MODEL']);
+        }
+
+        foreach (self::METRIC_MAP as $ident => $regName) {
+            if (!array_key_exists($regName, $raw)) {
+                continue;
+            }
+            $v = (int)$raw[$regName];
+
+            switch ($ident) {
+                case 'TempOutdoor':
+                case 'TempSupply':
+                case 'TempExtract':
+                case 'TempExhaust':
+                    $c = $this->ToCelsius($v);
+                    if ($c !== null) {
+                        $this->SetValueIfChanged($ident, $c);
+                    }
+                    break;
+
+                case 'Defrosting':
+                case 'Heater':
+                case 'ExtraHeater':
+                    if ($v !== self::RAW_INVALID) {
+                        $this->SetValueIfChanged($ident, $v > 0);
+                    }
+                    break;
+
+                default: // Prozent, ppm, Minuten, Tage, Zähler, CellState
+                    if ($v !== self::RAW_INVALID) {
+                        $this->SetValueIfChanged($ident, $v);
+                    }
+            }
+        }
+
+        $this->SetValueIfChanged('Profile', $this->DeriveProfile($raw));
+        $this->ComputeEfficiency($raw);
+    }
+
+    /**
+     * Wärmerückgewinnungs-Wirkungsgrad aus den Temperaturen berechnen (wie MyVallox),
+     * da das Gerät die Wirkungsgrad-Register nicht füllt (0xFFFF).
+     *
+     *   η_Zuluft = (Zuluft − Außen) / (Abluft − Außen)
+     *   η_Abluft = (Abluft − Fortluft) / (Abluft − Außen)
+     *
+     * Nur sinnvoll im Rückgewinnungsbetrieb (Zelle = Wärmerückgewinnung) und bei
+     * ausreichender Temperaturdifferenz; sonst wird der letzte Wert beibehalten.
+     *
+     * @param array<string,int> $raw
+     */
+    private function ComputeEfficiency(array $raw): void
+    {
+        $to = $this->ToCelsius((int)($raw['A_CYC_TEMP_OUTDOOR_AIR'] ?? 0));
+        $ts = $this->ToCelsius((int)($raw['A_CYC_TEMP_SUPPLY_AIR']  ?? 0));
+        $te = $this->ToCelsius((int)($raw['A_CYC_TEMP_EXTRACT_AIR'] ?? 0));
+        $tx = $this->ToCelsius((int)($raw['A_CYC_TEMP_EXHAUST_AIR'] ?? 0));
+        if ($to === null || $ts === null || $te === null || $tx === null) {
+            return;
+        }
+
+        $denom = $te - $to;
+        $cell  = $raw['A_CYC_CELL_STATE'] ?? null; // 0 = Wärmerückgewinnung
+        // Mindest-ΔT von 3 K vermeidet unsinnige Werte bei kleinen Differenzen/Bypass.
+        if ($cell !== 0 || $denom < 3.0) {
+            return;
+        }
+
+        $clamp = fn(float $v): int => (int)max(0, min(100, round($v)));
+        $this->SetValueIfChanged('SupplyEfficiency',  $clamp(($ts - $to) / $denom * 100));
+        $this->SetValueIfChanged('ExtractEfficiency', $clamp(($te - $tx) / $denom * 100));
+    }
+
+    /**
+     * Aktuelles Profil aus den Rohwerten ableiten (Logik der Referenz-Lib).
+     * @param array<string,int> $raw
+     */
+    private function DeriveProfile(array $raw): int
+    {
+        if ((int)($raw['A_CYC_BOOST_TIMER'] ?? 0) > 0) {
+            return self::PROFILE_BOOST;
+        }
+        if ((int)($raw['A_CYC_FIREPLACE_TIMER'] ?? 0) > 0) {
+            return self::PROFILE_FIREPLACE;
+        }
+        if ((int)($raw['A_CYC_EXTRA_TIMER'] ?? 0) > 0) {
+            return self::PROFILE_EXTRA;
+        }
+        $state = $raw['A_CYC_STATE'] ?? null;
+        if ($state === 0) {
+            return self::PROFILE_HOME;
+        }
+        if ($state === 1) {
+            return self::PROFILE_AWAY;
+        }
+        if ($state === 2) {
+            return self::PROFILE_AUTO;
+        }
+        return self::PROFILE_NONE;
+    }
+
+    private function ToCelsius(int $raw): ?float
+    {
+        if ($raw === 0 || $raw === self::RAW_INVALID) {
+            return null;
+        }
+        return round($raw / 100.0 - 273.15, 1);
+    }
+
+    private function UpdateModelName(int $index): void
+    {
+        $model = $this->LoadBundledModel();
+        $list  = $model['deviceModels'] ?? [];
+        $name  = $list[$index] ?? null;
+        if (is_string($name) && $name !== '') {
+            $this->SetValueIfChanged('Model', $name);
+            $this->SetSummary($name);
+        }
+    }
+
+    private function SetOffline(): void
+    {
+        $this->SetValueIfChanged('Online', false);
+        if ($this->GetStatus() != self::STATUS_OFFLINE) {
+            $this->LogMessage('Vallox ' . $this->ReadPropertyString('Host') . ' nicht erreichbar', KL_WARNING);
+        }
+        $this->SetStatus(self::STATUS_OFFLINE);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  PRIVATE: Datenmodell (Register → Offset)
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Liefert die aufgelöste Register-Map (name → {addr, offset}) oder false.
+     */
+    private function Regs()
+    {
+        $resolved = $this->ResolveModel(false);
+        if ($resolved === false) {
+            return false;
+        }
+        return $resolved['regs'];
+    }
+
+    /**
+     * Aufgelöstes Modell zurückgeben. Bei $forceReload oder leerem Attribut wird
+     * es neu ermittelt (Gerät bevorzugt, sonst Bundle) und im Attribut gecacht.
+     * @return array{regs:array,ws:array,source:string}|false
+     */
+    private function ResolveModel(bool $forceReload)
+    {
+        if (!$forceReload) {
+            $cached = $this->ReadAttributeString('ResolvedModel');
+            if ($cached !== '') {
+                $dec = json_decode($cached, true);
+                if (is_array($dec) && isset($dec['regs'], $dec['ws'])) {
+                    return $dec;
+                }
+            }
+        }
+
+        // 1) Versuche, das Modell vom Gerät zu laden.
+        $resolved = $this->ResolveFromUnit();
+
+        // 2) Fallback: mitgeliefertes Modell.
+        if ($resolved === false) {
+            $resolved = $this->ResolveFromBundle();
+        }
+
+        if ($resolved !== false) {
+            $this->WriteAttributeString('ResolvedModel', json_encode($resolved));
+        }
+        return $resolved;
+    }
+
+    /**
+     * Modell aus dem mitgelieferten datamodel.json aufbauen.
+     * @return array|false
+     */
+    private function ResolveFromBundle()
+    {
+        $model = $this->LoadBundledModel();
+        if ($model === false) {
+            return false;
+        }
+        $regs = $this->ComputeOffsets($model['ranges'], $model['registers']);
+        return ['regs' => $regs, 'ws' => $model['ws'], 'source' => 'bundle ' . ($model['sourceVersion'] ?? '?')];
+    }
+
+    /**
+     * Modell direkt vom Gerät laden (js/bundle.js bzw. js/vallox.js) und parsen.
+     * @return array|false
+     */
+    private function ResolveFromUnit()
+    {
+        $host = trim($this->ReadPropertyString('Host'));
+        if ($host === '') {
+            return false;
+        }
+        $js = false;
+        foreach (['js/bundle.js', 'js/vallox.js'] as $path) {
+            $js = $this->HttpGet('http://' . $host . '/' . $path);
+            if ($js !== false && strpos($js, 'VlxDevConstants') !== false) {
+                break;
+            }
+            $js = false;
+        }
+        if ($js === false) {
+            return false;
+        }
+
+        $constants = $this->ParseConstants($js);
+        $dev  = $constants['VlxDevConstants'] ?? [];
+        $read = $constants['VlxReadConstants'] ?? [];
+        if (!isset($dev['WS_WEB_UI_COMMAND_READ_TABLES'])) {
+            return false;
+        }
+
+        $ranges = $this->BuildRangesFromConstants($dev, $read);
+        if (count($ranges) === 0) {
+            return false;
+        }
+
+        // Adressen der kuratierten Register aus dem Geräte-Modell ziehen.
+        $bundle    = $this->LoadBundledModel();
+        $regNames  = array_keys($bundle['registers'] ?? []);
+        $registers = [];
+        foreach ($regNames as $name) {
+            if (isset($dev[$name])) {
+                $registers[$name] = (int)$dev[$name];
+            }
+        }
+        // A_CYC_MACHINE_MODEL zusätzlich sicherstellen.
+        if (isset($dev['A_CYC_MACHINE_MODEL'])) {
+            $registers['A_CYC_MACHINE_MODEL'] = (int)$dev['A_CYC_MACHINE_MODEL'];
+        }
+
+        $ws = [
+            'READ_TABLES' => (int)$dev['WS_WEB_UI_COMMAND_READ_TABLES'],
+            'WRITE_DATA'  => (int)$dev['WS_WEB_UI_COMMAND_WRITE_DATA'],
+            'READ_DATA'   => (int)($dev['WS_WEB_UI_COMMAND_READ_DATA'] ?? 250),
+        ];
+
+        $regs = $this->ComputeOffsets($ranges, $registers);
+        $this->SendDebug('Modell', 'Vom Gerät geladen, ' . count($regs) . ' Register aufgelöst', 0);
+        return ['regs' => $regs, 'ws' => $ws, 'source' => 'unit'];
+    }
+
+    /**
+     * Register-Adressen anhand der Buffer-Ranges auf Antwort-Offsets abbilden.
+     * @param array $ranges    Liste {start,end,count} in Buffer-Reihenfolge
+     * @param array $registers name → address
+     * @return array name → {addr, offset}
+     */
+    private function ComputeOffsets(array $ranges, array $registers): array
+    {
+        // Kumulativen Buffer-Offset je Range bestimmen.
+        $pos = 0;
+        $prepared = [];
+        foreach ($ranges as $r) {
+            $prepared[] = ['start' => (int)$r['start'], 'end' => (int)$r['end'], 'base' => $pos];
+            $pos += (int)$r['count'];
+        }
+
+        $out = [];
+        foreach ($registers as $name => $addr) {
+            $addr = (int)$addr;
+            foreach ($prepared as $p) {
+                if ($addr >= $p['start'] && $addr <= $p['end']) {
+                    $out[$name] = ['addr' => $addr, 'offset' => $p['base'] + ($addr - $p['start'])];
+                    break;
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Buffer-Ranges aus den Firmware-Konstanten aufbauen (Reihenfolge = Buffer-Layout).
+     * Spiegelt buffer_ranges.from_constants der Referenz-Lib.
+     */
+    private function BuildRangesFromConstants(array $dev, array $read): array
+    {
+        $ranges = [];
+        $isFwV2 = isset($dev['RANGE_START_g_self_test']);
+
+        $add = function (string $name, string $countKey, bool $required = true) use (&$ranges, $dev, $read) {
+            $sk = 'RANGE_START_' . $name;
+            $ek = 'RANGE_END_' . $name;
+            if (isset($dev[$sk], $dev[$ek], $read[$countKey])) {
+                $ranges[] = ['start' => (int)$dev[$sk], 'end' => (int)$dev[$ek], 'count' => (int)$read[$countKey], 'name' => $name];
+            } elseif ($required) {
+                $this->SendDebug('Modell', 'Range fehlt: ' . $name, 0);
+            }
+        };
+
+        $add('g_cyclone_general_info', 'CYC_NUM_OF_GENERAL_INFO');
+        $add('g_typhoon_general_info', 'CYC_NUM_OF_GENERAL_TYP_INFO');
+        $add('g_cyclone_hw_state', 'CYC_NUM_OF_HW_STATES');
+        $add('g_cyclone_sw_state', 'CYC_NUM_OF_SW_STATES');
+        $add('g_cyclone_time', 'CYC_NUM_OF_TIME_ELEMENTS');
+        $add('g_cyclone_output', 'CYC_NUM_OF_OUTPUTS');
+        $add('g_cyclone_input', 'CYC_NUM_OF_INPUTS');
+        $add('g_cyclone_config', 'CYC_NUM_OF_CONFIGS');
+        $add('g_cyclone_settings', 'CYC_NUM_OF_CYC_SETTINGS');
+        $add('g_typhoon_settings', 'CYC_NUM_OF_TYP_SETTINGS');
+        if ($isFwV2) {
+            $add('g_self_test', 'CYC_NUM_OF_SELF_TESTS');
+        } else {
+            $add('g_constant_flow', 'CYC_NUM_OF_CF');
+        }
+        $add('g_faults', 'CYC_NUM_OF_FAULTS');
+        $add('g_cyclone_weekly_schedule', 'CYC_NUM_OF_SCHEDULED_EVENTS');
+        $add('g_cyclone_extended', 'CYC_NUM_OF_EXT_SETTINGS', false);
+
+        return $ranges;
+    }
+
+    /**
+     * VlxDevConstants / VlxReadConstants aus einer JS-Datei extrahieren.
+     * Spiegelt DataModel._parse_js_file der Referenz-Lib.
+     * @return array{VlxDevConstants:array,VlxReadConstants:array}
+     */
+    private function ParseConstants(string $js): array
+    {
+        $out = ['VlxDevConstants' => [], 'VlxReadConstants' => []];
+        if (!preg_match_all('/(Vlx\w+)\.(\w+)\s*=\s*([\w.]+)\s*[,;]/i', $js, $m, PREG_SET_ORDER)) {
+            return $out;
+        }
+        foreach ($m as $match) {
+            $parent = $match[1];
+            if ($parent !== 'VlxDevConstants' && $parent !== 'VlxReadConstants') {
+                continue;
+            }
+            $key = $match[2];
+            $val = trim($match[3]);
+            if (isset($out[$parent][$key])) {
+                continue; // erste Definition gewinnt
+            }
+            if (preg_match('/^\d/', $val)) {
+                $num = (stripos($val, '0x') === 0) ? intval($val, 16) : (int)floatval($val);
+                $out[$parent][$key] = $num;
+            } else {
+                // Referenz auf andere Konstante "Parent.Key"
+                $path = explode('.', $val);
+                if (count($path) === 2 && isset($out[$path[0]][$path[1]])) {
+                    $out[$parent][$key] = $out[$path[0]][$path[1]];
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Mitgeliefertes Datenmodell laden (gecacht in $this->model).
+     * @return array|false
+     */
+    private function LoadBundledModel()
+    {
+        if (is_array($this->model)) {
+            return $this->model;
+        }
+        $file = __DIR__ . '/datamodel.json';
+        if (!is_file($file)) {
+            return false;
+        }
+        $dec = json_decode((string)file_get_contents($file), true);
+        if (!is_array($dec)) {
+            return false;
+        }
+        $this->model = $dec;
+        return $dec;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  PRIVATE: Nachrichten-Kodierung (Modbus-artig)
+    // ═══════════════════════════════════════════════════════════════
+
+    private function BuildReadTableRequest(): string
+    {
+        $resolved = $this->ResolveModel(false);
+        $cmd = $resolved['ws']['READ_TABLES'] ?? 246;
+        // length=3, command, items=0
+        $fields = pack('v', 3) . pack('v', $cmd) . pack('v', 0);
+        return $fields . pack('v', $this->Checksum16($fields));
+    }
+
+    /**
+     * @param array<string,int> $items name → uint16-Wert
+     */
+    private function BuildWriteRequest(array $items): string
+    {
+        $reg = $this->Regs();
+        $resolved = $this->ResolveModel(false);
+        $cmd = $resolved['ws']['WRITE_DATA'] ?? 249;
+
+        // name → address, nach Adresse sortiert (wie Referenz).
+        $pairs = [];
+        foreach ($items as $name => $value) {
+            if (!isset($reg[$name])) {
+                continue;
+            }
+            $pairs[] = ['addr' => $reg[$name]['addr'], 'value' => max(0, min(0xFFFF, (int)$value))];
+        }
+        usort($pairs, fn($a, $b) => $a['addr'] <=> $b['addr']);
+
+        $n = count($pairs);
+        $length = $n * 2 + 2;
+        $fields = pack('v', $length) . pack('v', $cmd);
+        foreach ($pairs as $p) {
+            $fields .= pack('v', $p['addr']) . pack('v', $p['value']);
+        }
+        return $fields . pack('v', $this->Checksum16($fields));
+    }
+
+    /**
+     * 16-Bit-Prüfsumme: Summe aller 16-Bit-LE-Wörter & 0xFFFF.
+     */
+    private function Checksum16(string $data): int
+    {
+        $c = 0;
+        $len = intdiv(strlen($data), 2);
+        for ($i = 0; $i < $len; $i++) {
+            $c += (ord($data[$i * 2 + 1]) << 8) + ord($data[$i * 2]);
+        }
+        return $c & 0xFFFF;
+    }
+
+    /**
+     * Binärstring als Array von uint16 (Big-Endian) interpretieren.
+     * @return int[]
+     */
+    private function ParseUint16BE(string $data): array
+    {
+        $len = intdiv(strlen($data), 2);
+        if ($len === 0) {
+            return [];
+        }
+        $vals = unpack('n*', substr($data, 0, $len * 2));
+        return array_values($vals);
+    }
+
+    private function WriteRegisters(array $items): bool
+    {
+        $payload = $this->BuildWriteRequest($items);
+        $frames  = $this->WsTransact([$payload], 1);
+        if ($frames === false) {
+            $this->SendDebug('WS', 'Schreibvorgang ohne Antwort', 0);
+            return false;
+        }
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  PRIVATE: HTTP
+    // ═══════════════════════════════════════════════════════════════
+
+    /** @return string|false */
+    private function HttpGet(string $url)
+    {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, self::HTTP_TIMEOUT);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, self::HTTP_TIMEOUT);
+        curl_setopt($ch, CURLOPT_ENCODING, ''); // Gerät liefert das JS-Modell gzip-komprimiert
+        $response = curl_exec($ch);
+        $error    = curl_error($ch);
+        $code     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($response === false || $response === '' || $code >= 400) {
+            $this->SendDebug('HTTP', 'GET ' . $url . ' fehlgeschlagen: ' . $error . ' (HTTP ' . $code . ')', 0);
+            return false;
+        }
+        return (string)$response;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  PRIVATE: WebSocket-Client (RFC 6455, reines PHP, Binärframes)
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Öffnet eine kurzlebige WS-Verbindung, sendet alle Binär-Payloads und liest
+     * genau $expectResponses Antwortframes (Text/Binary) ein.
+     *
+     * @param string[] $payloads
+     * @return string[]|false  Rohbytes der Antwortframes
+     */
+    private function WsTransact(array $payloads, int $expectResponses)
+    {
+        $host = trim($this->ReadPropertyString('Host'));
+        if ($host === '' || count($payloads) === 0) {
+            return false;
+        }
+
+        $errno = 0;
+        $errstr = '';
+        $fp = @stream_socket_client('tcp://' . $host . ':' . self::WS_PORT, $errno, $errstr, self::WS_TIMEOUT);
+        if ($fp === false) {
+            $this->SendDebug('WS', 'Verbindung fehlgeschlagen: ' . $errstr . ' (' . $errno . ')', 0);
+            return false;
+        }
+        stream_set_timeout($fp, self::WS_TIMEOUT);
+        $deadline = microtime(true) + self::WS_TIMEOUT;
+
+        // ── Handshake ───────────────────────────────────────────
+        $key = base64_encode(random_bytes(16));
+        $handshake = 'GET ' . self::WS_PATH . " HTTP/1.1\r\n"
+            . 'Host: ' . $host . "\r\n"
+            . "Upgrade: websocket\r\n"
+            . "Connection: Upgrade\r\n"
+            . 'Sec-WebSocket-Key: ' . $key . "\r\n"
+            . "Sec-WebSocket-Version: 13\r\n"
+            . "\r\n";
+        fwrite($fp, $handshake);
+
+        $headers = $this->WsReadHandshake($fp, $deadline);
+        if ($headers === false || strpos($headers, ' 101 ') === false) {
+            $this->SendDebug('WS', 'Handshake fehlgeschlagen: ' . substr((string)$headers, 0, 120), 0);
+            fclose($fp);
+            return false;
+        }
+
+        // ── Payloads senden (Binärframes) ───────────────────────
+        foreach ($payloads as $payload) {
+            fwrite($fp, $this->WsEncodeFrame($payload, 0x2));
+        }
+
+        // ── Antworten einsammeln ────────────────────────────────
+        $collected = [];
+        while (count($collected) < $expectResponses && microtime(true) < $deadline) {
+            $frame = $this->WsReadFrame($fp, $deadline);
+            if ($frame === false) {
+                break;
+            }
+            [$opcode, $data] = $frame;
+
+            if ($opcode === 0x8) { // Close
+                break;
+            }
+            if ($opcode === 0x9) { // Ping → Pong
+                fwrite($fp, $this->WsEncodeFrame($data, 0xA));
+                continue;
+            }
+            if ($opcode !== 0x1 && $opcode !== 0x2) {
+                continue;
+            }
+            $collected[] = $data;
+        }
+
+        @fwrite($fp, $this->WsEncodeFrame('', 0x8));
+        @fclose($fp);
+
+        if (count($collected) < $expectResponses) {
+            $this->SendDebug('WS', 'Zu wenige Antworten: ' . count($collected) . '/' . $expectResponses, 0);
+            return count($collected) > 0 ? $collected : false;
+        }
+        return $collected;
+    }
+
+    /** @return string|false */
+    private function WsReadHandshake($fp, float $deadline)
+    {
+        $buf = '';
+        while (strpos($buf, "\r\n\r\n") === false && microtime(true) < $deadline) {
+            $chunk = fread($fp, 512);
+            if ($chunk === false || $chunk === '') {
+                $meta = stream_get_meta_data($fp);
+                if (!empty($meta['timed_out'])) {
+                    return false;
+                }
+                usleep(10000);
+                continue;
+            }
+            $buf .= $chunk;
+            if (strlen($buf) > 8192) {
+                break;
+            }
+        }
+        return $buf === '' ? false : $buf;
+    }
+
+    private function WsEncodeFrame(string $payload, int $opcode = 0x2): string
+    {
+        $b1 = 0x80 | ($opcode & 0x0F);
+        $len = strlen($payload);
+        $header = chr($b1);
+
+        if ($len <= 125) {
+            $header .= chr(0x80 | $len);
+        } elseif ($len <= 0xFFFF) {
+            $header .= chr(0x80 | 126) . pack('n', $len);
+        } else {
+            $header .= chr(0x80 | 127) . pack('J', $len);
+        }
+
+        $mask = random_bytes(4);
+        $header .= $mask;
+
+        $masked = '';
+        for ($i = 0; $i < $len; $i++) {
+            $masked .= $payload[$i] ^ $mask[$i % 4];
+        }
+        return $header . $masked;
+    }
+
+    /**
+     * @return array{0:int,1:string}|false [opcode, payload]
+     */
+    private function WsReadFrame($fp, float $deadline)
+    {
+        $h = $this->WsReadExact($fp, 2, $deadline);
+        if ($h === false) {
+            return false;
+        }
+        $b1 = ord($h[0]);
+        $b2 = ord($h[1]);
+        $opcode = $b1 & 0x0F;
+        $masked = ($b2 & 0x80) !== 0;
+        $len = $b2 & 0x7F;
+
+        if ($len === 126) {
+            $ext = $this->WsReadExact($fp, 2, $deadline);
+            if ($ext === false) {
+                return false;
+            }
+            $len = unpack('n', $ext)[1];
+        } elseif ($len === 127) {
+            $ext = $this->WsReadExact($fp, 8, $deadline);
+            if ($ext === false) {
+                return false;
+            }
+            $len = unpack('J', $ext)[1];
+        }
+
+        $maskKey = '';
+        if ($masked) {
+            $maskKey = $this->WsReadExact($fp, 4, $deadline);
+            if ($maskKey === false) {
+                return false;
+            }
+        }
+
+        $payload = $len > 0 ? $this->WsReadExact($fp, $len, $deadline) : '';
+        if ($payload === false) {
+            return false;
+        }
+
+        if ($masked && $len > 0) {
+            for ($i = 0; $i < $len; $i++) {
+                $payload[$i] = $payload[$i] ^ $maskKey[$i % 4];
+            }
+        }
+        return [$opcode, $payload];
+    }
+
+    /** @return string|false */
+    private function WsReadExact($fp, int $count, float $deadline)
+    {
+        $buf = '';
+        while (strlen($buf) < $count && microtime(true) < $deadline) {
+            $chunk = fread($fp, $count - strlen($buf));
+            if ($chunk === false || $chunk === '') {
+                $meta = stream_get_meta_data($fp);
+                if (!empty($meta['timed_out']) || feof($fp)) {
+                    return false;
+                }
+                usleep(5000);
+                continue;
+            }
+            $buf .= $chunk;
+        }
+        return strlen($buf) === $count ? $buf : false;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  PRIVATE: Variablen & Profile
+    // ═══════════════════════════════════════════════════════════════
+
+    private function SetValueIfChanged(string $ident, $value): void
+    {
+        $vid = @$this->GetIDForIdent($ident);
+        if (!$vid) {
+            return;
+        }
+        $old = GetValue($vid);
+        if (is_float($old) || is_float($value)) {
+            if (round((float)$old, 3) === round((float)$value, 3)) {
+                return;
+            }
+        } elseif ($old === $value) {
+            return;
+        }
+        $this->SetValue($ident, $value);
+    }
+
+    private function GetProfileName(string $suffix): string
+    {
+        return 'VLX.' . $this->InstanceID . '.' . $suffix;
+    }
+
+    private function EnsureProfiles(): void
+    {
+        $pOnline = $this->GetProfileName('Online');
+        if (!IPS_VariableProfileExists($pOnline)) {
+            IPS_CreateVariableProfile($pOnline, VARIABLETYPE_BOOLEAN);
+            IPS_SetVariableProfileAssociation($pOnline, false, 'Offline', 'Close', 0xFF0000);
+            IPS_SetVariableProfileAssociation($pOnline, true, 'Online', 'Ok', 0x00CC00);
+            IPS_SetVariableProfileIcon($pOnline, 'Network');
+        }
+
+        $pProfile = $this->GetProfileName('Profile');
+        if (!IPS_VariableProfileExists($pProfile)) {
+            IPS_CreateVariableProfile($pProfile, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileIcon($pProfile, 'Climate');
+            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_NONE,      'Unbestimmt', '',        0x808080);
+            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_HOME,      'Home',       'House',   0x00CC00);
+            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_AWAY,      'Away',       'Moon',    0x0099FF);
+            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_BOOST,     'Boost',      'Speedo',  0xFF9900);
+            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_FIREPLACE, 'Fireplace',  'Flame',   0xFF3300);
+            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_EXTRA,     'Extra',      'Plus',    0xFFCC00);
+            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_AUTO,      'Auto',       'Gear',    0x00CCCC);
+        }
+
+        $pCell = $this->GetProfileName('CellState');
+        if (!IPS_VariableProfileExists($pCell)) {
+            IPS_CreateVariableProfile($pCell, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileAssociation($pCell, 0, 'Wärmerückgewinnung', 'Climate', 0xFF6600);
+            IPS_SetVariableProfileAssociation($pCell, 1, 'Kälterückgewinnung', 'Climate', 0x0099FF);
+            IPS_SetVariableProfileAssociation($pCell, 2, 'Bypass',             'Climate', 0x00CC00);
+            IPS_SetVariableProfileAssociation($pCell, 3, 'Abtauung',           'Climate', 0xCCCCCC);
+        }
+
+        $pPercent = $this->GetProfileName('Percent');
+        if (!IPS_VariableProfileExists($pPercent)) {
+            IPS_CreateVariableProfile($pPercent, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileText($pPercent, '', ' %');
+            IPS_SetVariableProfileValues($pPercent, 0, 100, 1);
+            IPS_SetVariableProfileIcon($pPercent, 'Ventilation');
+        }
+
+        $pRPM = $this->GetProfileName('RPM');
+        if (!IPS_VariableProfileExists($pRPM)) {
+            IPS_CreateVariableProfile($pRPM, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileText($pRPM, '', ' rpm');
+            IPS_SetVariableProfileIcon($pRPM, 'Ventilation');
+        }
+
+        $pCO2 = $this->GetProfileName('CO2');
+        if (!IPS_VariableProfileExists($pCO2)) {
+            IPS_CreateVariableProfile($pCO2, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileText($pCO2, '', ' ppm');
+            IPS_SetVariableProfileIcon($pCO2, 'Gauge');
+        }
+
+        $pMin = $this->GetProfileName('Minutes');
+        if (!IPS_VariableProfileExists($pMin)) {
+            IPS_CreateVariableProfile($pMin, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileText($pMin, '', ' min');
+            IPS_SetVariableProfileIcon($pMin, 'Clock');
+        }
+
+        $pHours = $this->GetProfileName('Hours');
+        if (!IPS_VariableProfileExists($pHours)) {
+            IPS_CreateVariableProfile($pHours, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileText($pHours, '', ' h');
+            IPS_SetVariableProfileIcon($pHours, 'Clock');
+        }
+
+        $pDays = $this->GetProfileName('Days');
+        if (!IPS_VariableProfileExists($pDays)) {
+            IPS_CreateVariableProfile($pDays, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileText($pDays, '', ' Tage');
+            IPS_SetVariableProfileIcon($pDays, 'Calendar');
+        }
+    }
+}
