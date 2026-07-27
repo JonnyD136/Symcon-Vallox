@@ -81,6 +81,13 @@ class ValloxMV extends IPSModule
         'UpTimeCurrent'     => 'A_CYC_CURRENT_UP_TIME_HOURS',
         'Heater'            => 'A_CYC_IO_HEATER',
         'ExtraHeater'       => 'A_CYC_IO_EXTRA_HEATER',
+        // Einstellbare Profil-Werte (Lüfterstufe % + Solltemperatur °C)
+        'HomeSpeed'       => 'A_CYC_HOME_SPEED_SETTING',
+        'AwaySpeed'       => 'A_CYC_AWAY_SPEED_SETTING',
+        'BoostSpeed'      => 'A_CYC_BOOST_SPEED_SETTING',
+        'HomeTempTarget'  => 'A_CYC_HOME_AIR_TEMP_TARGET',
+        'AwayTempTarget'  => 'A_CYC_AWAY_AIR_TEMP_TARGET',
+        'BoostTempTarget' => 'A_CYC_BOOST_AIR_TEMP_TARGET',
     ];
 
     /** In-Memory-Cache des aufgelösten Datenmodells (pro Request-Lauf). */
@@ -133,6 +140,21 @@ class ValloxMV extends IPSModule
         $this->RegisterVariableBoolean('ExtraHeater', 'Zusatz-Nachheizung', '~Switch', 230);
         $this->RegisterVariableInteger('UpTimeTotal',   'Betriebsstunden gesamt',  $this->GetProfileName('Hours'), 240);
         $this->RegisterVariableInteger('UpTimeCurrent', 'Betriebsstunden aktuell', $this->GetProfileName('Hours'), 250);
+
+        // ── Einstellbare Profil-Werte ───────────────────────────
+        $this->RegisterVariableInteger('HomeSpeed',  'Home – Lüfterstufe',  $this->GetProfileName('Percent'), 300);
+        $this->RegisterVariableInteger('AwaySpeed',  'Away – Lüfterstufe',  $this->GetProfileName('Percent'), 310);
+        $this->RegisterVariableInteger('BoostSpeed', 'Boost – Lüfterstufe', $this->GetProfileName('Percent'), 320);
+        $this->EnableAction('HomeSpeed');
+        $this->EnableAction('AwaySpeed');
+        $this->EnableAction('BoostSpeed');
+
+        $this->RegisterVariableFloat('HomeTempTarget',  'Home – Solltemperatur',  $this->GetProfileName('TempTarget'), 330);
+        $this->RegisterVariableFloat('AwayTempTarget',  'Away – Solltemperatur',  $this->GetProfileName('TempTarget'), 340);
+        $this->RegisterVariableFloat('BoostTempTarget', 'Boost – Solltemperatur', $this->GetProfileName('TempTarget'), 350);
+        $this->EnableAction('HomeTempTarget');
+        $this->EnableAction('AwayTempTarget');
+        $this->EnableAction('BoostTempTarget');
 
         $this->RegisterVariableInteger('BoostTimer',     'Boost verbleibend',     $this->GetProfileName('Minutes'), 150);
         $this->RegisterVariableInteger('FireplaceTimer', 'Kamin verbleibend',     $this->GetProfileName('Minutes'), 160);
@@ -318,6 +340,35 @@ class ValloxMV extends IPSModule
             case 'Profile':
                 $this->SetProfile((int)$Value);
                 break;
+
+            case 'HomeSpeed':
+            case 'AwaySpeed':
+            case 'BoostSpeed':
+                $map = [
+                    'HomeSpeed'  => 'A_CYC_HOME_SPEED_SETTING',
+                    'AwaySpeed'  => 'A_CYC_AWAY_SPEED_SETTING',
+                    'BoostSpeed' => 'A_CYC_BOOST_SPEED_SETTING',
+                ];
+                $val = max(0, min(100, (int)$Value));
+                if ($this->WriteRegisters([$map[$Ident] => $val])) {
+                    $this->SetValue($Ident, $val);
+                }
+                break;
+
+            case 'HomeTempTarget':
+            case 'AwayTempTarget':
+            case 'BoostTempTarget':
+                $map = [
+                    'HomeTempTarget'  => 'A_CYC_HOME_AIR_TEMP_TARGET',
+                    'AwayTempTarget'  => 'A_CYC_AWAY_AIR_TEMP_TARGET',
+                    'BoostTempTarget' => 'A_CYC_BOOST_AIR_TEMP_TARGET',
+                ];
+                $val = (float)$Value;
+                if ($this->WriteRegisters([$map[$Ident] => $this->ToKelvin($val)])) {
+                    $this->SetValue($Ident, $val);
+                }
+                break;
+
             default:
                 $this->SendDebug(__FUNCTION__, 'Unbekannter Ident: ' . $Ident, 0);
         }
@@ -437,6 +488,9 @@ class ValloxMV extends IPSModule
                 case 'TempSupply':
                 case 'TempExtract':
                 case 'TempExhaust':
+                case 'HomeTempTarget':
+                case 'AwayTempTarget':
+                case 'BoostTempTarget':
                     $c = $this->ToCelsius($v);
                     if ($c !== null) {
                         $this->SetValueIfChanged($ident, $c);
@@ -530,6 +584,14 @@ class ValloxMV extends IPSModule
             return null;
         }
         return round($raw / 100.0 - 273.15, 1);
+    }
+
+    /**
+     * °C → Vallox-Rohwert (Hundertstel Kelvin, 0,1-°C-Auflösung) wie die Referenz-Lib.
+     */
+    private function ToKelvin(float $celsius): int
+    {
+        return (int)(round($celsius * 10) * 10 + 27315);
     }
 
     private function UpdateModelName(int $index): void
@@ -1170,6 +1232,15 @@ class ValloxMV extends IPSModule
             IPS_CreateVariableProfile($pRPM, VARIABLETYPE_INTEGER);
             IPS_SetVariableProfileText($pRPM, '', ' rpm');
             IPS_SetVariableProfileIcon($pRPM, 'Ventilation');
+        }
+
+        $pTempTarget = $this->GetProfileName('TempTarget');
+        if (!IPS_VariableProfileExists($pTempTarget)) {
+            IPS_CreateVariableProfile($pTempTarget, VARIABLETYPE_FLOAT);
+            IPS_SetVariableProfileText($pTempTarget, '', ' °C');
+            IPS_SetVariableProfileValues($pTempTarget, 10, 25, 0.5);
+            IPS_SetVariableProfileDigits($pTempTarget, 1);
+            IPS_SetVariableProfileIcon($pTempTarget, 'Temperature');
         }
 
         $pCO2 = $this->GetProfileName('CO2');
