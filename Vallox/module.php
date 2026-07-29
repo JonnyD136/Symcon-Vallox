@@ -132,6 +132,10 @@ class ValloxMV extends IPSModule
         $this->RegisterVariableInteger('CO2', 'CO₂', $this->GetProfileName('CO2'), 90);
         $this->RegisterVariableInteger('CO2Rating', 'Luftqualität (CO₂)', $this->GetProfileName('CO2Level'), 95);
 
+        $this->RegisterVariableBoolean('ForcedActive', 'Zwangslüftung aktiv', $this->GetProfileName('Forced'), 96);
+        $this->RegisterVariableString('ForcedReason', 'Grund Zwangslüftung', '', 97);
+        $this->RegisterVariableInteger('ForcedSince', 'Zwangslüftung seit', '~UnixTimestamp', 98);
+
         $this->RegisterVariableInteger('FanSpeed',        'Lüfterstufe',                 $this->GetProfileName('Percent'), 100);
         $this->RegisterVariableInteger('ExtractFanSpeed', 'Abluftventilator (Drehzahl)', $this->GetProfileName('RPM'), 110);
         $this->RegisterVariableInteger('SupplyFanSpeed',  'Zuluftventilator (Drehzahl)', $this->GetProfileName('RPM'), 120);
@@ -522,6 +526,68 @@ class ValloxMV extends IPSModule
         $this->SetValueIfChanged('Profile', $this->DeriveProfile($raw));
         $this->ComputeEfficiency($raw);
         $this->RateCO2($raw);
+        $this->EvaluateForcedVentilation($raw);
+    }
+
+    /**
+     * Erkennt, ob die Anlage über ihre Profil-Grundstufe hinaus hochgefahren ist
+     * (Zwangslüftung durch CO₂-/Feuchte-Automatik), ermittelt den Grund und
+     * protokolliert das Ereignis beim Einsetzen ins Symcon-Log.
+     *
+     * @param array<string,int> $raw
+     */
+    private function EvaluateForcedVentilation(array $raw): void
+    {
+        $fan   = (int)($raw['A_CYC_FAN_SPEED'] ?? 0);
+        $state = $raw['A_CYC_STATE'] ?? null;
+
+        // Grundstufe des aktiven Profils (Home/Away). Für Boost/Auto gibt es keine
+        // feste Basis -> dort keine Zwangslüftungs-Erkennung.
+        $base = null;
+        if ($state === 0) {
+            $base = $raw['A_CYC_HOME_SPEED_SETTING'] ?? null;
+        } elseif ($state === 1) {
+            $base = $raw['A_CYC_AWAY_SPEED_SETTING'] ?? null;
+        }
+
+        if ($base === null) {
+            // Kein Basiswert bestimmbar (Auto/Boost) -> Zustand nicht auswerten.
+            return;
+        }
+
+        $active = $fan > ((int)$base + 5); // 5 % Toleranz
+
+        // Grund ermitteln (CO₂-Schwelle / Feuchte-Basislevel überschritten)
+        $reasons = [];
+        $co2 = (int)($raw['A_CYC_CO2_VALUE'] ?? self::RAW_INVALID);
+        $thr = (int)($raw['A_CYC_CO2_THRESHOLD'] ?? 0);
+        if ($co2 !== self::RAW_INVALID && $co2 > 0 && $thr > 0 && $co2 >= $thr) {
+            $reasons[] = 'CO₂';
+        }
+        $rh   = (int)($raw['A_CYC_RH_VALUE'] ?? self::RAW_INVALID);
+        $rhb  = (int)($raw['A_CYC_RH_BASIC_LEVEL'] ?? 0);
+        if ($rh !== self::RAW_INVALID && $rh > 0 && $rhb > 0 && $rh >= $rhb) {
+            $reasons[] = 'Feuchte';
+        }
+        $reasonStr = $active ? ($reasons ? implode(' + ', $reasons) : 'unbekannt') : '—';
+
+        $was = (bool)@GetValue(@$this->GetIDForIdent('ForcedActive'));
+
+        $this->SetValueIfChanged('ForcedActive', $active);
+        $this->SetValueIfChanged('ForcedReason', $reasonStr);
+
+        if ($active && !$was) {
+            // Beginn einer Zwangslüftung -> Zeitpunkt + Log-Eintrag
+            $this->SetValueIfChanged('ForcedSince', time());
+            $this->LogMessage(sprintf(
+                'Zwangslüftung AN – Grund: %s (Lüfter %d%% > Basis %d%%, CO₂ %s ppm/Schwelle %d, Feuchte %s%%/Basis %d)',
+                $reasonStr, $fan, (int)$base,
+                $co2 === self::RAW_INVALID ? 'n/a' : $co2, $thr,
+                $rh === self::RAW_INVALID ? 'n/a' : $rh, $rhb
+            ), KL_MESSAGE);
+        } elseif (!$active && $was) {
+            $this->LogMessage(sprintf('Zwangslüftung AUS (Lüfter %d%% zurück auf Basis %d%%)', $fan, (int)$base), KL_MESSAGE);
+        }
     }
 
     /**
@@ -1263,6 +1329,13 @@ class ValloxMV extends IPSModule
             IPS_CreateVariableProfile($pRPM, VARIABLETYPE_INTEGER);
             IPS_SetVariableProfileText($pRPM, '', ' rpm');
             IPS_SetVariableProfileIcon($pRPM, 'Ventilation');
+        }
+
+        $pForced = $this->GetProfileName('Forced');
+        if (!IPS_VariableProfileExists($pForced)) {
+            IPS_CreateVariableProfile($pForced, VARIABLETYPE_BOOLEAN);
+            IPS_SetVariableProfileAssociation($pForced, false, 'Nein', '', 0x808080);
+            IPS_SetVariableProfileAssociation($pForced, true, 'Ja', 'Ventilation', 0xFF8000);
         }
 
         $pCO2 = $this->GetProfileName('CO2');
