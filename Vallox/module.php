@@ -57,6 +57,10 @@ class ValloxMV extends IPSModule
 
     private const RAW_INVALID = 0xFFFF;
 
+    // Schneller Poll-Burst nach einem Moduswechsel (Lüfter rampen verzögert hoch).
+    private const FASTPOLL_INTERVAL = 3000; // ms
+    private const FASTPOLL_COUNT    = 5;    // zusätzliche Polls nach dem Sofort-Poll
+
     /** Register, die als Statusvariablen gepflegt werden (Ident-Suffix ⇒ Register). */
     private const METRIC_MAP = [
         'TempOutdoor'     => 'A_CYC_TEMP_OUTDOOR_AIR',
@@ -104,8 +108,10 @@ class ValloxMV extends IPSModule
 
         // Aufgelöstes Modell (regs: name → {addr, offset}, ws, source). Leer = noch nicht ermittelt.
         $this->RegisterAttributeString('ResolvedModel', '');
+        $this->RegisterAttributeInteger('FastPollRemaining', 0);
 
         $this->RegisterTimer('PollTimer', 0, 'VLX_Poll($_IPS["TARGET"]);');
+        $this->RegisterTimer('FastPollTimer', 0, 'VLX_FastPoll($_IPS["TARGET"]);');
 
         $this->EnsureProfiles();
 
@@ -211,6 +217,31 @@ class ValloxMV extends IPSModule
     }
 
     /**
+     * Ein Poll aus dem Schnell-Burst (nach Moduswechsel). Zählt runter und
+     * stoppt den Burst-Timer, sobald keine weiteren Läufe mehr offen sind.
+     */
+    public function FastPoll(): void
+    {
+        $this->Poll();
+        $remaining = $this->ReadAttributeInteger('FastPollRemaining') - 1;
+        $this->WriteAttributeInteger('FastPollRemaining', max(0, $remaining));
+        if ($remaining <= 0) {
+            $this->SetTimerInterval('FastPollTimer', 0);
+        }
+    }
+
+    /**
+     * Startet nach einem Modus-/Stufenwechsel einen kurzen Poll-Burst, damit die
+     * hochlaufenden Lüfterdrehzahlen (rpm) zeitnah sichtbar werden.
+     */
+    private function TriggerFastPoll(): void
+    {
+        $this->Poll(); // sofort
+        $this->WriteAttributeInteger('FastPollRemaining', self::FASTPOLL_COUNT);
+        $this->SetTimerInterval('FastPollTimer', self::FASTPOLL_INTERVAL);
+    }
+
+    /**
      * Datenmodell (Register-Offsets) neu ermitteln – bevorzugt vom Gerät,
      * sonst aus dem mitgelieferten Modell. Aktualisiert außerdem den Modellnamen.
      */
@@ -291,7 +322,7 @@ class ValloxMV extends IPSModule
 
         $ok = $this->WriteRegisters($writes);
         if ($ok) {
-            $this->Poll();
+            $this->TriggerFastPoll();
         }
         return $ok;
     }
@@ -343,6 +374,7 @@ class ValloxMV extends IPSModule
                 $val = max(0, min(100, (int)$Value));
                 if ($this->WriteRegisters([$map[$Ident] => $val])) {
                     $this->SetValue($Ident, $val);
+                    $this->TriggerFastPoll();
                 }
                 break;
 
