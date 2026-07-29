@@ -129,6 +129,7 @@ class ValloxMV extends IPSModule
         $this->RegisterVariableFloat('TempExhaust', 'Fortluft',  '~Temperature', 70);
 
         $this->RegisterVariableFloat('Humidity', 'Luftfeuchte', '~Humidity.F', 80);
+        $this->RegisterVariableInteger('HumidityRating', 'Feuchte-Bewertung', $this->GetProfileName('HumLevel'), 85);
         $this->RegisterVariableInteger('CO2', 'CO₂', $this->GetProfileName('CO2'), 90);
         $this->RegisterVariableInteger('CO2Rating', 'Luftqualität (CO₂)', $this->GetProfileName('CO2Level'), 95);
 
@@ -333,6 +334,33 @@ class ValloxMV extends IPSModule
     }
 
     /**
+     * Lüfterstufe (%) eines Profils setzen (schreibt A_CYC_<PROFIL>_SPEED_SETTING).
+     * Praktisch für Skripte/Automationen (z. B. saisonale Zuhause-Anpassung).
+     *
+     * @param int $Profile 1=Home, 2=Away, 3=Boost
+     * @param int $Percent 0–100
+     */
+    public function SetProfileSpeed(int $Profile, int $Percent): bool
+    {
+        $map = [
+            self::PROFILE_HOME  => ['A_CYC_HOME_SPEED_SETTING', 'HomeSpeed'],
+            self::PROFILE_AWAY  => ['A_CYC_AWAY_SPEED_SETTING', 'AwaySpeed'],
+            self::PROFILE_BOOST => ['A_CYC_BOOST_SPEED_SETTING', 'BoostSpeed'],
+        ];
+        if (!isset($map[$Profile])) {
+            $this->SendDebug(__FUNCTION__, 'Profil ohne feste Stufe: ' . $Profile, 0);
+            return false;
+        }
+        [$reg, $ident] = $map[$Profile];
+        $pct = max(0, min(100, $Percent));
+        $ok = $this->WriteRegisters([$reg => $pct]);
+        if ($ok) {
+            $this->SetValueIfChanged($ident, $pct);
+        }
+        return $ok;
+    }
+
+    /**
      * Ein einzelnes Register anhand seines Namens lesen (Debug/Test-Center).
      * @return string
      */
@@ -526,7 +554,37 @@ class ValloxMV extends IPSModule
         $this->SetValueIfChanged('Profile', $this->DeriveProfile($raw));
         $this->ComputeEfficiency($raw);
         $this->RateCO2($raw);
+        $this->RateHumidity($raw);
         $this->EvaluateForcedVentilation($raw);
+    }
+
+    /**
+     * Luftfeuchte in eine Bewertung einordnen (Zielkorridor 40–55 %).
+     *
+     * @param array<string,int> $raw
+     */
+    private function RateHumidity(array $raw): void
+    {
+        if (!array_key_exists('A_CYC_RH_VALUE', $raw)) {
+            return;
+        }
+        $rh = (int)$raw['A_CYC_RH_VALUE'];
+        if ($rh === self::RAW_INVALID || $rh <= 0) {
+            return; // kein Sensor / ungültig
+        }
+
+        if ($rh < 35) {
+            $level = 2; // Zu trocken
+        } elseif ($rh < 40) {
+            $level = 1; // Etwas trocken
+        } elseif ($rh <= 55) {
+            $level = 0; // Optimal
+        } elseif ($rh <= 60) {
+            $level = 3; // Etwas feucht
+        } else {
+            $level = 4; // Zu feucht
+        }
+        $this->SetValueIfChanged('HumidityRating', $level);
     }
 
     /**
@@ -1329,6 +1387,17 @@ class ValloxMV extends IPSModule
             IPS_CreateVariableProfile($pRPM, VARIABLETYPE_INTEGER);
             IPS_SetVariableProfileText($pRPM, '', ' rpm');
             IPS_SetVariableProfileIcon($pRPM, 'Ventilation');
+        }
+
+        $pHum = $this->GetProfileName('HumLevel');
+        if (!IPS_VariableProfileExists($pHum)) {
+            IPS_CreateVariableProfile($pHum, VARIABLETYPE_INTEGER);
+            IPS_SetVariableProfileIcon($pHum, 'Drops');
+            IPS_SetVariableProfileAssociation($pHum, 0, 'Optimal (40–55 %)', '', 0x00C853);
+            IPS_SetVariableProfileAssociation($pHum, 1, 'Etwas trocken',     '', 0xFFC107);
+            IPS_SetVariableProfileAssociation($pHum, 2, 'Zu trocken (<35 %)', '', 0xD50000);
+            IPS_SetVariableProfileAssociation($pHum, 3, 'Etwas feucht',      '', 0xFFC107);
+            IPS_SetVariableProfileAssociation($pHum, 4, 'Zu feucht (>60 %)',  '', 0xD50000);
         }
 
         $pForced = $this->GetProfileName('Forced');
