@@ -57,6 +57,38 @@ class ValloxMV extends IPSModule
 
     private const RAW_INVALID = 0xFFFF;
 
+    // ─── Anzeigetexte (DRY-Quelle für Profile UND Text-Variablen) ────
+    // Werden sowohl für die Variablenprofil-Assoziationen als auch für die
+    // String-Spiegel (…Text) verwendet, damit beides nie auseinanderläuft.
+    private const TXT_PROFILE = [
+        self::PROFILE_HOME      => 'Zuhause',
+        self::PROFILE_AWAY      => 'Abwesend',
+        self::PROFILE_BOOST     => 'Boost',
+        self::PROFILE_FIREPLACE => 'Kamin',
+        self::PROFILE_EXTRA     => 'Extra',
+        self::PROFILE_AUTO      => 'Auto',
+    ];
+    private const TXT_CELL = [
+        0 => 'Wärmerückgewinnung',
+        1 => 'Kälterückgewinnung',
+        2 => 'Bypass',
+        3 => 'Abtauung',
+    ];
+    private const TXT_CO2LVL = [
+        0 => 'Sehr gut',
+        1 => 'Gut',
+        2 => 'Mäßig',
+        3 => 'Schlecht',
+        4 => 'Sehr schlecht',
+    ];
+    private const TXT_HUMLVL = [
+        0 => 'Optimal',
+        1 => 'Etwas trocken',
+        2 => 'Zu trocken',
+        3 => 'Etwas feucht',
+        4 => 'Zu feucht',
+    ];
+
     // Schneller Poll-Burst nach einem Moduswechsel (Lüfter rampen verzögert hoch).
     // 3-s-Takt über ~2 Minuten, damit die rpm-Rampe komplett sichtbar wird.
     private const FASTPOLL_INTERVAL = 3000; // ms
@@ -165,6 +197,18 @@ class ValloxMV extends IPSModule
 
         $this->RegisterVariableInteger('FilterDaysLeft', 'Filterwechsel in', $this->GetProfileName('Days'), 180);
         $this->RegisterVariableInteger('FaultCount',     'Aktive Störungen', '',                            190);
+
+        // ── Anzeigetexte (read-only Spiegel für Visualisierungen/IPSView) ──
+        // IPSView stellt Strings immer korrekt dar, unabhängig davon, ob es
+        // instanzeigene Variablenprofile auflösen kann.
+        $this->RegisterVariableString('BetriebsartText',    'Betriebsart',    '', 400);
+        $this->RegisterVariableString('LuftqualitaetText',  'Luftqualität',   '', 410);
+        $this->RegisterVariableString('WaermetauscherText', 'Wärmetauscher',  '', 420);
+        $this->RegisterVariableString('AbtauungText',       'Abtauung',       '', 430);
+        $this->RegisterVariableString('NachheizungText',    'Nachheizung',    '', 440);
+        $this->RegisterVariableString('ZwangslueftungText', 'Zwangslüftung',  '', 450);
+        $this->RegisterVariableString('CO2Text',            'CO₂ (Text)',     '', 460);
+        $this->RegisterVariableString('FeuchteText',        'Feuchte (Text)', '', 470);
     }
 
     public function ApplyChanges()
@@ -556,6 +600,54 @@ class ValloxMV extends IPSModule
         $this->RateCO2($raw);
         $this->RateHumidity($raw);
         $this->EvaluateForcedVentilation($raw);
+        $this->UpdateTextMirrors($raw);
+    }
+
+    /**
+     * Schreibt die String-Spiegel der bewerteten/aufgezählten Werte.
+     * Muss nach den Bewertungs- und Auswertungsmethoden laufen, da es deren
+     * Ergebnisse aus den Statusvariablen übernimmt.
+     *
+     * @param array<string,int> $raw
+     */
+    private function UpdateTextMirrors(array $raw): void
+    {
+        $val = function (string $ident) {
+            $vid = @$this->GetIDForIdent($ident);
+            return $vid ? GetValue($vid) : null;
+        };
+
+        $profile = $val('Profile');
+        $this->SetValueIfChanged('BetriebsartText', self::TXT_PROFILE[$profile] ?? '—');
+
+        $cell = $val('CellState');
+        $this->SetValueIfChanged('WaermetauscherText', self::TXT_CELL[$cell] ?? '—');
+
+        // CO₂: nur wenn ein Sensor plausible Werte liefert.
+        $co2 = (int)($raw['A_CYC_CO2_VALUE'] ?? self::RAW_INVALID);
+        if ($co2 !== self::RAW_INVALID && $co2 > 0) {
+            $this->SetValueIfChanged('CO2Text', sprintf('%d ppm', $co2));
+            $this->SetValueIfChanged('LuftqualitaetText', self::TXT_CO2LVL[$val('CO2Rating')] ?? '—');
+        } else {
+            $this->SetValueIfChanged('CO2Text', '—');
+            $this->SetValueIfChanged('LuftqualitaetText', '—');
+        }
+
+        $rh = (int)($raw['A_CYC_RH_VALUE'] ?? self::RAW_INVALID);
+        if ($rh !== self::RAW_INVALID && $rh > 0) {
+            $this->SetValueIfChanged('FeuchteText', sprintf('%d %% – %s', $rh, self::TXT_HUMLVL[$val('HumidityRating')] ?? '?'));
+        } else {
+            $this->SetValueIfChanged('FeuchteText', '—');
+        }
+
+        $this->SetValueIfChanged('AbtauungText',       $val('Defrosting') ? 'Aktiv' : 'Aus');
+        $this->SetValueIfChanged('NachheizungText',    $val('Heater') ? 'An' : 'Aus');
+        $forced = (bool)$val('ForcedActive');
+        $reason = (string)$val('ForcedReason');
+        $this->SetValueIfChanged(
+            'ZwangslueftungText',
+            $forced ? ('Ja' . ($reason !== '' && $reason !== '—' ? ' (' . $reason . ')' : '')) : 'Nein'
+        );
     }
 
     /**
@@ -1352,26 +1444,35 @@ class ValloxMV extends IPSModule
             IPS_SetVariableProfileIcon($pOnline, 'Network');
         }
 
+        // Profil-Assoziationen bewusst bei JEDEM Aufruf setzen (nicht nur beim
+        // Erstellen), damit die deutschen Beschriftungen ApplyChanges überleben.
         $pProfile = $this->GetProfileName('Profile');
         if (!IPS_VariableProfileExists($pProfile)) {
             IPS_CreateVariableProfile($pProfile, VARIABLETYPE_INTEGER);
-            IPS_SetVariableProfileIcon($pProfile, 'Climate');
-            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_NONE,      'Unbestimmt', '',        0x808080);
-            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_HOME,      'Home',       'House',   0x00CC00);
-            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_AWAY,      'Away',       'Moon',    0x0099FF);
-            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_BOOST,     'Boost',      'Speedo',  0xFF9900);
-            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_FIREPLACE, 'Fireplace',  'Flame',   0xFF3300);
-            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_EXTRA,     'Extra',      'Plus',    0xFFCC00);
-            IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_AUTO,      'Auto',       'Gear',    0x00CCCC);
+        }
+        IPS_SetVariableProfileIcon($pProfile, 'Climate');
+        $profileMeta = [
+            self::PROFILE_NONE      => ['',        0x808080],
+            self::PROFILE_HOME      => ['House',   0x00CC00],
+            self::PROFILE_AWAY      => ['Moon',    0x0099FF],
+            self::PROFILE_BOOST     => ['Speedo',  0xFF9900],
+            self::PROFILE_FIREPLACE => ['Flame',   0xFF3300],
+            self::PROFILE_EXTRA     => ['Plus',    0xFFCC00],
+            self::PROFILE_AUTO      => ['Gear',    0x00CCCC],
+        ];
+        IPS_SetVariableProfileAssociation($pProfile, self::PROFILE_NONE, 'Unbestimmt', '', 0x808080);
+        foreach (self::TXT_PROFILE as $value => $name) {
+            [$icon, $color] = $profileMeta[$value] ?? ['', -1];
+            IPS_SetVariableProfileAssociation($pProfile, $value, $name, $icon, $color);
         }
 
         $pCell = $this->GetProfileName('CellState');
         if (!IPS_VariableProfileExists($pCell)) {
             IPS_CreateVariableProfile($pCell, VARIABLETYPE_INTEGER);
-            IPS_SetVariableProfileAssociation($pCell, 0, 'Wärmerückgewinnung', 'Climate', 0xFF6600);
-            IPS_SetVariableProfileAssociation($pCell, 1, 'Kälterückgewinnung', 'Climate', 0x0099FF);
-            IPS_SetVariableProfileAssociation($pCell, 2, 'Bypass',             'Climate', 0x00CC00);
-            IPS_SetVariableProfileAssociation($pCell, 3, 'Abtauung',           'Climate', 0xCCCCCC);
+        }
+        $cellColors = [0 => 0xFF6600, 1 => 0x0099FF, 2 => 0x00CC00, 3 => 0xCCCCCC];
+        foreach (self::TXT_CELL as $value => $name) {
+            IPS_SetVariableProfileAssociation($pCell, $value, $name, 'Climate', $cellColors[$value] ?? -1);
         }
 
         $pPercent = $this->GetProfileName('Percent');
@@ -1389,23 +1490,25 @@ class ValloxMV extends IPSModule
             IPS_SetVariableProfileIcon($pRPM, 'Ventilation');
         }
 
+        // Im Profil stehen die Grenzwerte mit dabei; die Kurzform aus
+        // TXT_HUMLVL wird in FeuchteText verwendet (dort steht der %-Wert davor).
         $pHum = $this->GetProfileName('HumLevel');
         if (!IPS_VariableProfileExists($pHum)) {
             IPS_CreateVariableProfile($pHum, VARIABLETYPE_INTEGER);
-            IPS_SetVariableProfileIcon($pHum, 'Drops');
-            IPS_SetVariableProfileAssociation($pHum, 0, 'Optimal (40–55 %)', '', 0x00C853);
-            IPS_SetVariableProfileAssociation($pHum, 1, 'Etwas trocken',     '', 0xFFC107);
-            IPS_SetVariableProfileAssociation($pHum, 2, 'Zu trocken (<35 %)', '', 0xD50000);
-            IPS_SetVariableProfileAssociation($pHum, 3, 'Etwas feucht',      '', 0xFFC107);
-            IPS_SetVariableProfileAssociation($pHum, 4, 'Zu feucht (>60 %)',  '', 0xD50000);
         }
+        IPS_SetVariableProfileIcon($pHum, 'Drops');
+        IPS_SetVariableProfileAssociation($pHum, 0, 'Optimal (40–55 %)',  '', 0x00C853);
+        IPS_SetVariableProfileAssociation($pHum, 1, 'Etwas trocken',      '', 0xFFC107);
+        IPS_SetVariableProfileAssociation($pHum, 2, 'Zu trocken (<35 %)', '', 0xD50000);
+        IPS_SetVariableProfileAssociation($pHum, 3, 'Etwas feucht',       '', 0xFFC107);
+        IPS_SetVariableProfileAssociation($pHum, 4, 'Zu feucht (>60 %)',  '', 0xD50000);
 
         $pForced = $this->GetProfileName('Forced');
         if (!IPS_VariableProfileExists($pForced)) {
             IPS_CreateVariableProfile($pForced, VARIABLETYPE_BOOLEAN);
-            IPS_SetVariableProfileAssociation($pForced, false, 'Nein', '', 0x808080);
-            IPS_SetVariableProfileAssociation($pForced, true, 'Ja', 'Ventilation', 0xFF8000);
         }
+        IPS_SetVariableProfileAssociation($pForced, false, 'Nein', '', 0x808080);
+        IPS_SetVariableProfileAssociation($pForced, true, 'Ja', 'Ventilation', 0xFF8000);
 
         $pCO2 = $this->GetProfileName('CO2');
         if (!IPS_VariableProfileExists($pCO2)) {
@@ -1417,12 +1520,11 @@ class ValloxMV extends IPSModule
         $pCO2Level = $this->GetProfileName('CO2Level');
         if (!IPS_VariableProfileExists($pCO2Level)) {
             IPS_CreateVariableProfile($pCO2Level, VARIABLETYPE_INTEGER);
-            IPS_SetVariableProfileIcon($pCO2Level, 'Gauge');
-            IPS_SetVariableProfileAssociation($pCO2Level, 0, 'Sehr gut',      '', 0x00C853);
-            IPS_SetVariableProfileAssociation($pCO2Level, 1, 'Gut',           '', 0x8BC34A);
-            IPS_SetVariableProfileAssociation($pCO2Level, 2, 'Mäßig',         '', 0xFFC107);
-            IPS_SetVariableProfileAssociation($pCO2Level, 3, 'Schlecht',      '', 0xFF8000);
-            IPS_SetVariableProfileAssociation($pCO2Level, 4, 'Sehr schlecht', '', 0xD50000);
+        }
+        IPS_SetVariableProfileIcon($pCO2Level, 'Gauge');
+        $co2Colors = [0 => 0x00C853, 1 => 0x8BC34A, 2 => 0xFFC107, 3 => 0xFF8000, 4 => 0xD50000];
+        foreach (self::TXT_CO2LVL as $value => $name) {
+            IPS_SetVariableProfileAssociation($pCO2Level, $value, $name, '', $co2Colors[$value] ?? -1);
         }
 
         $pMin = $this->GetProfileName('Minutes');
