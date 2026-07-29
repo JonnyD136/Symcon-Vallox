@@ -58,8 +58,9 @@ class ValloxMV extends IPSModule
     private const RAW_INVALID = 0xFFFF;
 
     // Schneller Poll-Burst nach einem Moduswechsel (Lüfter rampen verzögert hoch).
+    // 3-s-Takt über ~2 Minuten, damit die rpm-Rampe komplett sichtbar wird.
     private const FASTPOLL_INTERVAL = 3000; // ms
-    private const FASTPOLL_COUNT    = 5;    // zusätzliche Polls nach dem Sofort-Poll
+    private const FASTPOLL_COUNT    = 40;   // zusätzliche Polls nach dem Sofort-Poll (≈120 s)
 
     /** Register, die als Statusvariablen gepflegt werden (Ident-Suffix ⇒ Register). */
     private const METRIC_MAP = [
