@@ -691,8 +691,7 @@ class ValloxMV extends IPSModule
         $fan   = (int)($raw['A_CYC_FAN_SPEED'] ?? 0);
         $state = $raw['A_CYC_STATE'] ?? null;
 
-        // Grundstufe des aktiven Profils (Home/Away). Für Boost/Auto gibt es keine
-        // feste Basis -> dort keine Zwangslüftungs-Erkennung.
+        // Grundstufe des aktiven Profils (Home/Away). Bei Auto gibt es keine feste Basis.
         $base = null;
         if ($state === 0) {
             $base = $raw['A_CYC_HOME_SPEED_SETTING'] ?? null;
@@ -700,14 +699,17 @@ class ValloxMV extends IPSModule
             $base = $raw['A_CYC_AWAY_SPEED_SETTING'] ?? null;
         }
 
-        if ($base === null) {
-            // Kein Basiswert bestimmbar (Auto/Boost) -> Zustand nicht auswerten.
-            return;
-        }
+        // Läuft ein Zeitprofil (Boost/Kamin/Extra), erklärt das die erhöhte Drehzahl:
+        // A_CYC_STATE bleibt dabei auf Home/Away, deshalb sonst falsch-positiv.
+        $timed = ((int)($raw['A_CYC_BOOST_TIMER'] ?? 0) > 0)
+              || ((int)($raw['A_CYC_FIREPLACE_TIMER'] ?? 0) > 0)
+              || ((int)($raw['A_CYC_EXTRA_TIMER'] ?? 0) > 0);
 
-        $active = $fan > ((int)$base + 5); // 5 % Toleranz
+        $active = ($base !== null) && !$timed && ($fan > (int)$base + 5); // 5 % Toleranz
 
-        // Grund ermitteln (CO₂-Schwelle / Feuchte-Basislevel überschritten)
+        // Grund ermitteln (CO₂-Schwelle / Feuchte über Basislevel).
+        // Das Gerät führt A_CYC_RH_BASIC_LEVEL als gleitende Basis nach, deshalb
+        // braucht es einen echten Abstand statt nur ">=".
         $reasons = [];
         $co2 = (int)($raw['A_CYC_CO2_VALUE'] ?? self::RAW_INVALID);
         $thr = (int)($raw['A_CYC_CO2_THRESHOLD'] ?? 0);
@@ -716,7 +718,7 @@ class ValloxMV extends IPSModule
         }
         $rh   = (int)($raw['A_CYC_RH_VALUE'] ?? self::RAW_INVALID);
         $rhb  = (int)($raw['A_CYC_RH_BASIC_LEVEL'] ?? 0);
-        if ($rh !== self::RAW_INVALID && $rh > 0 && $rhb > 0 && $rh >= $rhb) {
+        if ($rh !== self::RAW_INVALID && $rh > 0 && $rhb > 0 && $rh >= $rhb + 2) {
             $reasons[] = 'Feuchte';
         }
         $reasonStr = $active ? ($reasons ? implode(' + ', $reasons) : 'unbekannt') : '—';
