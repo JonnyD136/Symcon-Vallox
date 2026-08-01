@@ -145,6 +145,7 @@ class ValloxMV extends IPSModule
 
         $this->RegisterTimer('PollTimer', 0, 'VLX_Poll($_IPS["TARGET"]);');
         $this->RegisterTimer('FastPollTimer', 0, 'VLX_FastPoll($_IPS["TARGET"]);');
+        $this->RegisterTimer('EnergyTimer', 0, 'VLX_UpdateEnergy($_IPS["TARGET"]);');
 
         $this->EnsureProfiles();
 
@@ -217,6 +218,10 @@ class ValloxMV extends IPSModule
 
         // Verbrauchsvariable spiegeln (unabhängig von der Geräteverbindung).
         $this->SetupPowerMirror();
+
+        if (IPS_GetKernelRunlevel() == KR_READY) {
+            $this->UpdateEnergy();
+        }
 
         $host = trim($this->ReadPropertyString('Host'));
         if ($host === '') {
@@ -378,6 +383,75 @@ class ValloxMV extends IPSModule
     }
 
     /**
+     * Jahresverbrauch als Hochrechnung aus der gemessenen Leistung aktualisieren.
+     *
+     * Kein Zähler: gebildet wird der zeitgewichtete Mittelwert der archivierten
+     * Leistung der verknüpften Messvariable (max. 365 Tage) und daraus
+     *   kWh/Jahr = Ø Leistung [W] × 8760 h / 1000
+     * Solange noch keine Tageswerte vorliegen, dienen Stundenwerte als Basis,
+     * ganz am Anfang der Momentanwert.
+     */
+    public function UpdateEnergy(): bool
+    {
+        $src = $this->ReadPropertyInteger('PowerVariableID');
+        if ($src <= 0 || !IPS_VariableExists($src) || !@$this->GetIDForIdent('AnnualEnergy')) {
+            return false;
+        }
+        $archive = $this->GetArchiveID();
+        if ($archive === 0) {
+            $this->SendDebug(__FUNCTION__, 'Kein Archive-Handler vorhanden', 0);
+            return false;
+        }
+
+        $now = time();
+
+        // 1) Tages-Aggregate über maximal ein Jahr (Stufe 1 = täglich).
+        [$avg, $dur] = $this->AggregateMean($archive, $src, 1, $now - 365 * 86400, $now);
+
+        // 2) Zu wenig Historie -> Stunden-Aggregate der letzten Woche (Stufe 0).
+        if ($dur < 3600) {
+            [$avg, $dur] = $this->AggregateMean($archive, $src, 0, $now - 7 * 86400, $now);
+        }
+
+        if ($dur > 0) {
+            $basis = $dur < 86400
+                ? sprintf('Ø über %.1f Stunden', $dur / 3600)
+                : sprintf('Ø über %.1f Tage', $dur / 86400);
+        } else {
+            // 3) Fallback: Momentanwert (direkt nach Aktivierung der Archivierung).
+            $avg   = (float)GetValue($src);
+            $basis = 'Momentanwert (noch keine Historie)';
+        }
+
+        $this->SetValueIfChanged('AvgPower', round($avg, 1));
+        $this->SetValueIfChanged('AnnualEnergy', round($avg * 8760 / 1000, 1));
+        $this->SetValueIfChanged('EnergyBasis', sprintf('%.1f W · %s', $avg, $basis));
+        return true;
+    }
+
+    /**
+     * Zeitgewichteter Mittelwert aus Archiv-Aggregaten.
+     *
+     * @return array{0:float,1:int} [Mittelwert, gewichtete Gesamtdauer in Sekunden]
+     */
+    private function AggregateMean(int $archive, int $varID, int $stage, int $from, int $to): array
+    {
+        $sum = 0.0;
+        $dur = 0;
+        $rows = @AC_GetAggregatedValues($archive, $varID, $stage, $from, $to, 0);
+        if (is_array($rows)) {
+            foreach ($rows as $r) {
+                $d = (int)($r['Duration'] ?? 0);
+                if ($d > 0) {
+                    $sum += (float)$r['Avg'] * $d;
+                    $dur += $d;
+                }
+            }
+        }
+        return [$dur > 0 ? $sum / $dur : 0.0, $dur];
+    }
+
+    /**
      * Lüfterstufe (%) eines Profils setzen (schreibt A_CYC_<PROFIL>_SPEED_SETTING).
      * Praktisch für Skripte/Automationen (z. B. saisonale Zuhause-Anpassung).
      *
@@ -498,10 +572,36 @@ class ValloxMV extends IPSModule
             $this->MaintainVariable('PowerConsumption', 'Verbrauch', $type, $profile, 195, true);
             $this->RegisterMessage($id, VM_UPDATE);
             $this->UpdatePowerMirror();
+
+            // Energie-Hochrechnung: Variablen anlegen, Archivierung der Quelle
+            // sicherstellen (ohne Historie ist kein Durchschnitt möglich) und Timer starten.
+            $this->MaintainVariable('AvgPower', 'Ø Leistung', VARIABLETYPE_FLOAT, $this->GetProfileName('Watt'), 196, true);
+            $this->MaintainVariable('AnnualEnergy', 'Jahresverbrauch (Prognose)', VARIABLETYPE_FLOAT, $this->GetProfileName('kWh'), 197, true);
+            $this->MaintainVariable('EnergyBasis', 'Prognose-Basis', VARIABLETYPE_STRING, '', 198, true);
+
+            $archive = $this->GetArchiveID();
+            if ($archive > 0 && !AC_GetLoggingStatus($archive, $id)) {
+                AC_SetLoggingStatus($archive, $id, true);
+                $this->SendDebug('Energie', 'Archivierung für Quellvariable #' . $id . ' aktiviert', 0);
+            }
+            $this->SetTimerInterval('EnergyTimer', 3600 * 1000); // stündlich
         } else {
-            // Verknüpfung entfernt → Variable wieder abbauen.
+            // Verknüpfung entfernt → Variablen wieder abbauen.
             $this->MaintainVariable('PowerConsumption', 'Verbrauch', VARIABLETYPE_FLOAT, '', 195, false);
+            $this->MaintainVariable('AvgPower', 'Ø Leistung', VARIABLETYPE_FLOAT, '', 196, false);
+            $this->MaintainVariable('AnnualEnergy', 'Jahresverbrauch (Prognose)', VARIABLETYPE_FLOAT, '', 197, false);
+            $this->MaintainVariable('EnergyBasis', 'Prognose-Basis', VARIABLETYPE_STRING, '', 198, false);
+            $this->SetTimerInterval('EnergyTimer', 0);
         }
+    }
+
+    /**
+     * Instanz-ID des Archive-Handlers (oder 0, wenn keiner vorhanden).
+     */
+    private function GetArchiveID(): int
+    {
+        $ids = IPS_GetInstanceListByModuleID('{43192F0B-135B-4CE7-A0A7-1475603F3060}');
+        return count($ids) > 0 ? (int)$ids[0] : 0;
     }
 
     /**
@@ -1511,6 +1611,22 @@ class ValloxMV extends IPSModule
         }
         IPS_SetVariableProfileAssociation($pForced, false, 'Nein', '', 0x808080);
         IPS_SetVariableProfileAssociation($pForced, true, 'Ja', 'Ventilation', 0xFF8000);
+
+        $pWatt = $this->GetProfileName('Watt');
+        if (!IPS_VariableProfileExists($pWatt)) {
+            IPS_CreateVariableProfile($pWatt, VARIABLETYPE_FLOAT);
+            IPS_SetVariableProfileText($pWatt, '', ' W');
+            IPS_SetVariableProfileDigits($pWatt, 1);
+            IPS_SetVariableProfileIcon($pWatt, 'Electricity');
+        }
+
+        $pKwh = $this->GetProfileName('kWh');
+        if (!IPS_VariableProfileExists($pKwh)) {
+            IPS_CreateVariableProfile($pKwh, VARIABLETYPE_FLOAT);
+            IPS_SetVariableProfileText($pKwh, '', ' kWh');
+            IPS_SetVariableProfileDigits($pKwh, 1);
+            IPS_SetVariableProfileIcon($pKwh, 'Electricity');
+        }
 
         $pCO2 = $this->GetProfileName('CO2');
         if (!IPS_VariableProfileExists($pCO2)) {

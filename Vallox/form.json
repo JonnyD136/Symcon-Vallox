@@ -33,7 +33,8 @@
       "type": "RowLayout",
       "items": [
         { "type": "Button", "caption": "Jetzt abfragen",        "onClick": "VLX_Poll($id);" },
-        { "type": "Button", "caption": "Geräteinfo aktualisieren", "onClick": "VLX_RequestInfo($id);" }
+        { "type": "Button", "caption": "Geräteinfo aktualisieren", "onClick": "VLX_RequestInfo($id);" },
+        { "type": "Button", "caption": "Jahresverbrauch neu berechnen", "onClick": "VLX_UpdateEnergy($id);" }
       ]
     },
     {
